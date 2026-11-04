@@ -285,6 +285,11 @@ struct ShaderTranspileCache::Impl
 
     Impl()
     {
+        // Read the diagnostic switches first: they also apply to a disabled cache,
+        // where the per-shader phase numbers are the "before" measurement.
+        verify = EnvTruthy("PROJECTM_SHADER_CACHE_VERIFY");
+        debug = EnvTruthy("PROJECTM_SHADER_CACHE_DEBUG");
+
         // The cache is on by default; only an explicit false value turns it off.
         const std::string disableValue = EnvValue("PROJECTM_SHADER_CACHE");
         if (!disableValue.empty() && !EnvTruthy("PROJECTM_SHADER_CACHE"))
@@ -292,9 +297,6 @@ struct ShaderTranspileCache::Impl
             disabledReason = "PROJECTM_SHADER_CACHE is set to a false value";
             return;
         }
-
-        verify = EnvTruthy("PROJECTM_SHADER_CACHE_VERIFY");
-        debug = EnvTruthy("PROJECTM_SHADER_CACHE_DEBUG");
 
         std::filesystem::path cacheDirectory;
         const std::string overrideDirectory = EnvValue("PROJECTM_SHADER_CACHE_DIR");
@@ -330,10 +332,7 @@ struct ShaderTranspileCache::Impl
         }
 
         std::error_code error;
-        if (!std::filesystem::is_directory(cacheDirectory, error))
-        {
-            std::filesystem::create_directories(cacheDirectory, error);
-        }
+        std::filesystem::create_directories(cacheDirectory, error);
         if (error)
         {
             disabledReason = "cannot create " + cacheDirectory.string() + ": " + error.message();
@@ -614,6 +613,11 @@ void ShaderTranspileCache::Store(const std::string& key, const std::string& glsl
     }
 
     const double start = NowMilliseconds();
+
+    // The whole write is under the lock: the temporary name is per process, so two
+    // threads storing at once would otherwise share it.
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+
     const auto path = m_impl->EnabledEntryPath(key);
     const auto temporary = std::filesystem::path(path.string() + ".tmp." + std::to_string(ProcessId()));
 
@@ -647,7 +651,6 @@ void ShaderTranspileCache::Store(const std::string& key, const std::string& glsl
     {
         std::error_code removeError;
         std::filesystem::remove(temporary, removeError);
-        std::lock_guard<std::mutex> lock(m_impl->mutex);
         ++m_impl->storeFailures;
         if (m_impl->storeFailures == 1 && m_impl->debug)
         {
@@ -657,9 +660,7 @@ void ShaderTranspileCache::Store(const std::string& key, const std::string& glsl
         return;
     }
 
-    const double elapsed = NowMilliseconds() - start;
-    std::lock_guard<std::mutex> lock(m_impl->mutex);
-    m_impl->storeMilliseconds += elapsed;
+    m_impl->storeMilliseconds += NowMilliseconds() - start;
     ++m_impl->stores;
     m_impl->PruneIfNeeded();
 }
@@ -671,6 +672,7 @@ void ShaderTranspileCache::Discard(const std::string& key)
         return;
     }
 
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
     std::error_code error;
     std::filesystem::remove(m_impl->EnabledEntryPath(key), error);
 }
