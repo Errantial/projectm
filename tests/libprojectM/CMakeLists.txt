@@ -31,6 +31,7 @@ add_executable(projectM-unittest
         LoggingTest.cpp
         MilkdropShaderCommentParsingTest.cpp
         PresetFileParserTest.cpp
+        ShaderTranspileCacheTest.cpp
         WaveformAlignerTest.cpp
 
         $<TARGET_OBJECTS:Audio>
