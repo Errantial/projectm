@@ -27,6 +27,16 @@ CustomWaveform::CustomWaveform(PresetState& presetState)
     m_mesh.SetVertexCount(std::max(Audio::SpectrumSamples, Audio::WaveformSamples) * 2 + 2);
 }
 
+CustomWaveform::CustomWaveform(PresetState& presetState, PreparedPreset::Code& perFrame, PreparedPreset::Code& perPoint)
+    : m_presetState(presetState)
+    , m_perFrameContext(perFrame.TakeContext(), perFrame.TakeCode())
+    , m_perPointContext(perPoint.TakeContext(), perPoint.TakeCode())
+    , m_mesh(Renderer::VertexBufferUsage::StreamDraw, true, false)
+    , m_codePrepared(true)
+{
+    m_mesh.SetVertexCount(std::max(Audio::SpectrumSamples, Audio::WaveformSamples) * 2 + 2);
+}
+
 void CustomWaveform::Initialize(PresetFileParser& parsedFile, int index)
 {
     std::string const wavecodePrefix = "wavecode_" + std::to_string(index) + "_";
@@ -60,8 +70,11 @@ void CustomWaveform::CompileCodeAndRunInitExpressions(const PerFrameContext& pre
         m_tValuesAfterInitCode[t] = *m_perFrameContext.t_vars[t];
     }
 
-    m_perFrameContext.CompilePerFrameCode(m_presetState.customWavePerFrameCode[m_index], *this);
-    m_perPointContext.CompilePerPointCode(m_presetState.customWavePerPointCode[m_index], *this);
+    if (!m_codePrepared)
+    {
+        m_perFrameContext.CompilePerFrameCode(m_presetState.customWavePerFrameCode[m_index], m_index);
+        m_perPointContext.CompilePerPointCode(m_presetState.customWavePerPointCode[m_index], m_index);
+    }
 }
 
 void CustomWaveform::Draw(const PerFrameContext& presetPerFrameContext)
@@ -93,6 +106,9 @@ void CustomWaveform::Draw(const PerFrameContext& presetPerFrameContext)
     {
         return;
     }
+
+    // The sample offsets below can reach before the start of the audio arrays; see PresetState.
+    m_presetState.MirrorPreparedRegisters();
 
     const auto* pcmL = m_spectrum
                            ? m_presetState.audioData.spectrumLeft.data()

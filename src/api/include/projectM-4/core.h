@@ -126,6 +126,23 @@ PROJECTM_EXPORT void projectm_load_preset_data(projectm_handle instance, const c
                                                bool smooth_transition);
 
 /**
+ * @brief Prepares preset data for a later projectm_load_preset_data() call with the same data.
+ *
+ * Parses the preset and compiles its expression code, and runs the leading statements of its
+ * per-frame init code that do not depend on when they run (typically loops that fill gmegabuf).
+ * None of this needs OpenGL, so it can run on any thread, while another preset is drawn.
+ * projectm_load_preset_data() with byte-for-byte the same data then takes the result over
+ * instead of doing the work itself; the preset behaves exactly as if it had not been prepared.
+ *
+ * Prepared data waits in a small store shared by all instances; the oldest entry is dropped
+ * when it is full, so preparing a preset that is never loaded costs nothing but the work.
+ * Data that does not parse or compile is not kept, and loading it reports the usual error.
+ *
+ * @param data The preset contents, as they will be passed to projectm_load_preset_data().
+ */
+PROJECTM_EXPORT void projectm_prepare_preset_data(const char* data);
+
+/**
  * @brief Reloads all textures.
  *
  * Calling this method will clear and reload all textures, including the main rendering texture.

@@ -26,6 +26,20 @@ CustomShape::CustomShape(PresetState& presetState)
     m_perFrameContext.RegisterBuiltinVariables();
 }
 
+CustomShape::CustomShape(PresetState& presetState, PreparedPreset::Code& perFrame)
+    : m_outlineMesh(Renderer::VertexBufferUsage::StreamDraw)
+    , m_fillMesh(Renderer::VertexBufferUsage::StreamDraw, true, false)
+    , m_presetState(presetState)
+    , m_perFrameContext(perFrame.TakeContext(), perFrame.TakeCode())
+    , m_codePrepared(true)
+{
+    m_outlineMesh.SetVertexCount(100);
+    m_outlineMesh.SetRenderPrimitiveType(Renderer::Mesh::PrimitiveType::LineLoop);
+
+    m_fillMesh.SetVertexCount(102);
+    m_fillMesh.SetRenderPrimitiveType(Renderer::Mesh::PrimitiveType::TriangleFan);
+}
+
 void CustomShape::Initialize(PresetFileParser& parsedFile, int index)
 {
     std::string const shapecodePrefix = "shapecode_" + std::to_string(index) + "_";
@@ -70,7 +84,10 @@ void CustomShape::CompileCodeAndRunInitExpressions()
         m_tValuesAfterInitCode[t] = *m_perFrameContext.t_vars[t];
     }
 
-    m_perFrameContext.CompilePerFrameCode(m_presetState.customShapePerFrameCode[m_index], *this);
+    if (!m_codePrepared)
+    {
+        m_perFrameContext.CompilePerFrameCode(m_presetState.customShapePerFrameCode[m_index], m_index);
+    }
 }
 
 void CustomShape::Draw()

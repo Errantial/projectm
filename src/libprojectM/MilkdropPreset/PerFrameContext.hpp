@@ -4,6 +4,10 @@
 
 #include <projectm-eval.h>
 
+#include <array>
+#include <cstddef>
+#include <vector>
+
 namespace libprojectM {
 namespace MilkdropPreset {
 
@@ -31,12 +35,30 @@ public:
     /**
      * @brief Destructor.
      */
+    /**
+     * @brief Takes over a context, and the code compiled in it, that a PreparedPreset built on another thread.
+     * Variable values are kept as they are; only the pointers to them are looked up again.
+     * @param adoptedContext The context. This object destroys it.
+     * @param adoptedCode The compiled code, or nullptr if there is none.
+     */
+    PerFrameContext(projectm_eval_context* adoptedContext, projectm_eval_code* adoptedCode);
+
     ~PerFrameContext();
+
+    /**
+     * @brief Hands the context and the compiled code to the caller, who then owns them.
+     */
+    void Release(projectm_eval_context*& context, projectm_eval_code*& code);
 
     /**
      * @brief Registers the state variables in the expression evaluator context.
      */
     void RegisterBuiltinVariables();
+
+    /**
+     * @brief Looks up the pointers to the built-in variables without changing their values.
+     */
+    void RegisterVariablePointers();
 
     /**
      * @brief Loads the current state values into the expression evaluator variables.
@@ -50,6 +72,22 @@ public:
      * @param perFrameInitCode The init code.
      */
     void EvaluateInitCode(PresetState& state);
+
+    /**
+     * @brief The names of the built-in variables other than q1-q32, as registered.
+     */
+    auto BuiltinVariableNames() const -> const std::vector<const char*>&
+    {
+        return m_builtinNames;
+    }
+
+    /**
+     * @brief Uses init code a PreparedPreset compiled in this context, and may have partly run,
+     * instead of compiling it in EvaluateInitCode().
+     * @param initCode The compiled init code still to run, or nullptr if none is left. This object destroys it.
+     * @param qValues q1-q32 as the statements that already ran left them.
+     */
+    void SetPreparedInitCode(projectm_eval_code* initCode, const std::array<PRJM_EVAL_F, QVarCount>& qValues);
 
     /**
      * @brief Compiles the per-frame code and stores the code handle in the class.
@@ -144,6 +182,12 @@ public:
     PRJM_EVAL_F* blur1_edge_darken{};
 
     PRJM_EVAL_F q_values_after_init_code[QVarCount]{};
+
+private:
+    std::vector<const char*> m_builtinNames; //!< Built-in variable names other than q1-q32.
+    bool m_initPrepared{false};                      //!< The init code was compiled, and maybe partly run, ahead.
+    projectm_eval_code* m_preparedInitCode{nullptr}; //!< What of it is left to run.
+    std::array<PRJM_EVAL_F, QVarCount> m_preparedQValues{}; //!< q1-q32 after what already ran.
 };
 
 } // namespace MilkdropPreset

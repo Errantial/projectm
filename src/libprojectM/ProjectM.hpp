@@ -100,6 +100,20 @@ public:
      */
     void LoadPresetData(std::istream& presetData, bool smoothTransition);
 
+    /**
+     * @brief Loads a preset from data that projectm_prepare_preset_data() prepared, if it did.
+     * @param presetData The preset data, exactly as it was prepared.
+     * @param smoothTransition If set to true, old and new presets will be blended over smoothly.
+     * @return False if this data was not prepared; nothing was loaded then.
+     */
+    auto LoadPreparedPresetData(const char* presetData, bool smoothTransition) -> bool;
+
+    /**
+     * @brief Parses and compiles preset data ahead of a LoadPreparedPresetData() call. Thread-safe.
+     * @param presetData The preset data.
+     */
+    static void PreparePresetData(const char* presetData);
+
     void SetWindowSize(uint32_t width, uint32_t height);
 
     /**

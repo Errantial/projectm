@@ -53,6 +53,28 @@ MilkdropPreset::MilkdropPreset(std::istream& presetData)
     Load(presetData);
 }
 
+MilkdropPreset::MilkdropPreset(std::unique_ptr<PreparedPreset> prepared)
+    : m_state(prepared->TakeGlobalMemory(), std::move(prepared->registers))
+    , m_perFrameContext(prepared->perFrame.TakeContext(), prepared->perFrame.TakeCode())
+    , m_perPixelContext(prepared->perPixel.TakeContext(), prepared->perPixel.TakeCode())
+    , m_motionVectors(m_state)
+    , m_waveform(m_state)
+    , m_darkenCenter(m_state)
+    , m_border(m_state)
+    , m_prepared(std::move(prepared))
+    , m_codePrepared(true)
+{
+    LOG_DEBUG("[MilkdropPreset] Loading preset from prepared data.");
+
+    m_perFrameContext.SetPreparedInitCode(m_prepared->perFrameInit, m_prepared->qAfterRanAhead);
+    m_prepared->perFrameInit = nullptr;
+
+    InitializePreset(m_prepared->parser);
+
+    // Everything is owned by the preset's own objects now.
+    m_prepared.reset();
+}
+
 void MilkdropPreset::Initialize(const Renderer::RenderContext& renderContext)
 {
     assert(renderContext.textureManager);
@@ -134,6 +156,7 @@ void MilkdropPreset::RenderFrame(const libprojectM::Audio::FrameAudioData& audio
     {
         wave->Draw(m_perFrameContext);
     }
+    m_state.MirrorPreparedRegisters();
     m_waveform.Draw(m_perFrameContext);
 
     // Done in DrawSprites() in Milkdrop
@@ -247,14 +270,20 @@ void MilkdropPreset::InitializePreset(PresetFileParser& parsedFile)
     // Load global init variables into the state
     m_state.Initialize(parsedFile);
 
-    // Register code context variables
-    m_perFrameContext.RegisterBuiltinVariables();
-    m_perPixelContext.RegisterBuiltinVariables();
+    // Register code context variables. Prepared contexts already have them, and their values
+    // (the init code that ran ahead) must stay.
+    if (!m_prepared)
+    {
+        m_perFrameContext.RegisterBuiltinVariables();
+        m_perPixelContext.RegisterBuiltinVariables();
+    }
 
     // Custom waveforms:
     for (int i = 0; i < CustomWaveformCount; i++)
     {
-        auto wave = std::make_unique<CustomWaveform>(m_state);
+        auto wave = m_prepared
+                        ? std::make_unique<CustomWaveform>(m_state, m_prepared->wavePerFrame[i], m_prepared->wavePerPoint[i])
+                        : std::make_unique<CustomWaveform>(m_state);
         wave->Initialize(parsedFile, i);
         m_customWaveforms[i] = std::move(wave);
     }
@@ -262,7 +291,9 @@ void MilkdropPreset::InitializePreset(PresetFileParser& parsedFile)
     // Custom shapes:
     for (int i = 0; i < CustomShapeCount; i++)
     {
-        auto shape = std::make_unique<CustomShape>(m_state);
+        auto shape = m_prepared
+                         ? std::make_unique<CustomShape>(m_state, m_prepared->shapePerFrame[i])
+                         : std::make_unique<CustomShape>(m_state);
         shape->Initialize(parsedFile, i);
         m_customShapes[i] = std::move(shape);
     }
@@ -276,10 +307,13 @@ void MilkdropPreset::CompileCodeAndRunInitExpressions()
     // Per-frame init and code
     m_perFrameContext.LoadStateVariables(m_state);
     m_perFrameContext.EvaluateInitCode(m_state);
-    m_perFrameContext.CompilePerFrameCode(m_state.perFrameCode);
+    if (!m_codePrepared)
+    {
+        m_perFrameContext.CompilePerFrameCode(m_state.perFrameCode);
 
-    // Per-vertex code
-    m_perPixelContext.CompilePerPixelCode(m_state.perPixelCode);
+        // Per-vertex code
+        m_perPixelContext.CompilePerPixelCode(m_state.perPixelCode);
+    }
 
     for (int i = 0; i < CustomWaveformCount; i++)
     {

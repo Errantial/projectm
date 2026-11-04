@@ -1,5 +1,6 @@
 #pragma once
 
+#include "PreparedPreset.hpp"
 #include "WaveformPerFrameContext.hpp"
 #include "WaveformPerPointContext.hpp"
 
@@ -23,6 +24,12 @@ public:
      * @param presetState The preset state container.
      */
     explicit CustomWaveform(PresetState& presetState);
+
+    /**
+     * @brief Creates the waveform around per-frame and per-point code compiled ahead of time.
+     * The blocks are taken over and left empty.
+     */
+    CustomWaveform(PresetState& presetState, PreparedPreset::Code& perFrame, PreparedPreset::Code& perPoint);
 
     /**
      * @brief Loads the initial values and code from the preset file.
@@ -98,6 +105,8 @@ private:
     WaveformPerPointContext m_perPointContext; //!< Holds the code execution context for per-point expressions
 
     Renderer::Mesh m_mesh; //!< Points in this waveform.
+
+    bool m_codePrepared{false}; //!< The per-frame and per-point code was compiled ahead of time.
 
     friend class WaveformPerFrameContext;
     friend class WaveformPerPointContext;

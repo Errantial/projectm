@@ -6,6 +6,21 @@
 namespace libprojectM {
 namespace MilkdropPreset {
 
+void Factory::PreparePresetData(const char* data)
+{
+    PreparedPreset::Prepare(data);
+}
+
+auto Factory::LoadPreparedPreset(const char* data) -> std::unique_ptr<::libprojectM::Preset>
+{
+    auto prepared = PreparedPreset::Take(data);
+    if (!prepared)
+    {
+        return {};
+    }
+    return std::make_unique<MilkdropPreset>(std::move(prepared));
+}
+
 std::unique_ptr<::libprojectM::Preset> Factory::LoadPresetFromFile(const std::string& filename)
 {
     std::string path;

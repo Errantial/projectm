@@ -16,8 +16,15 @@ const glm::mat4 PresetState::orthogonalProjection = glm::ortho(-1.0f, 1.0f, 1.0f
 const glm::mat4 PresetState::orthogonalProjectionFlipped = glm::ortho(-1.0f, 1.0f, -1.0f, 1.0f, -40.0f, 40.0f);
 
 PresetState::PresetState()
-    : globalMemory(projectm_eval_memory_buffer_create())
+    : PresetState(projectm_eval_memory_buffer_create(), nullptr)
 {
+}
+
+PresetState::PresetState(projectm_eval_mem_buffer adoptedMemory, std::unique_ptr<GlobalRegisters> adoptedRegisters)
+    : globalMemory(adoptedMemory)
+    , preparedRegisters(std::move(adoptedRegisters))
+{
+    MirrorPreparedRegisters();
     std::random_device randomDevice;
     std::mt19937 randomGenerator(randomDevice());
     std::uniform_int_distribution<> distrib(0, std::numeric_limits<int>::max());

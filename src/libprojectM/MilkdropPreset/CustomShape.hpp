@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Constants.hpp"
+#include "PreparedPreset.hpp"
 #include "PresetState.hpp"
 #include "ShapePerFrameContext.hpp"
 
@@ -25,6 +26,12 @@ class CustomShape
 {
 public:
     CustomShape(PresetState& presetState);
+
+    /**
+     * @brief Creates the shape around per-frame code compiled ahead of time.
+     * The block is taken over and left empty.
+     */
+    CustomShape(PresetState& presetState, PreparedPreset::Code& perFrame);
 
     virtual ~CustomShape() = default;
 
@@ -61,8 +68,6 @@ private:
         GLint outlineFirst{0};     //!< First vertex of the first outline pass in the outline mesh.
         float borderColor[4]{};    //!< Outline color.
     };
-
-    std::vector<InstanceDraw> m_instanceDraws; //!< Per-instance draw state, reused every frame.
 
     Renderer::Mesh m_outlineMesh; //!< The shape's border/outline mesh.
     Renderer::Mesh m_fillMesh; //!< The shape's color/texture mesh.
@@ -107,6 +112,9 @@ private:
 
     PresetState& m_presetState; //!< The global preset state.
     ShapePerFrameContext m_perFrameContext;
+    bool m_codePrepared{false}; //!< The per-frame code was compiled ahead of time.
+
+    std::vector<InstanceDraw> m_instanceDraws; //!< Per-instance draw state, reused every frame. Last, so the original members keep their offsets.
 
     friend class ShapePerFrameContext;
 };

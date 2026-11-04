@@ -117,9 +117,18 @@ void projectm_load_preset_file(projectm_handle instance, const char* filename,
 void projectm_load_preset_data(projectm_handle instance, const char* data,
                                bool smooth_transition)
 {
-    std::stringstream presetDataStream(data);
     auto projectMInstance = handle_to_instance(instance);
+    if (projectMInstance->LoadPreparedPresetData(data, smooth_transition))
+    {
+        return;
+    }
+    std::stringstream presetDataStream(data);
     projectMInstance->LoadPresetData(presetDataStream, smooth_transition);
+}
+
+void projectm_prepare_preset_data(const char* data)
+{
+    libprojectM::ProjectM::PreparePresetData(data);
 }
 
 void projectm_set_preset_switch_requested_event_callback(projectm_handle instance,

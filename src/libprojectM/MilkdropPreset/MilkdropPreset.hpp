@@ -32,6 +32,7 @@
 #include "PerFrameContext.hpp"
 #include "PerPixelContext.hpp"
 #include "PerPixelMesh.hpp"
+#include "PreparedPreset.hpp"
 #include "Preset.hpp"
 #include "Waveform.hpp"
 
@@ -65,6 +66,12 @@ public:
      * @param presetOutputs initialized and filled with data parsed from a MilkdropPreset
      */
     MilkdropPreset(std::istream& presetData);
+
+    /**
+     * @brief Creates a preset from data a PreparedPreset already parsed and compiled.
+     * @param prepared The prepared preset, from PreparedPreset::Take().
+     */
+    explicit MilkdropPreset(std::unique_ptr<PreparedPreset> prepared);
 
     /**
      * @brief Initializes the preset with rendering-related data.
@@ -129,6 +136,9 @@ private:
     FinalComposite m_finalComposite; //!< Final composite shader or filters.
 
     bool m_isFirstFrame{true}; //!< Controls drawing the motion vectors starting with the second frame.
+
+    std::unique_ptr<PreparedPreset> m_prepared; //!< Set only while the constructor takes a prepared preset over.
+    bool m_codePrepared{false};                 //!< The expression code was compiled ahead of time.
 };
 
 } // namespace MilkdropPreset
