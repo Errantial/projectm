@@ -8,6 +8,8 @@
 
 #include <projectm-eval.h>
 
+#include <vector>
+
 namespace libprojectM {
 namespace MilkdropPreset {
 
@@ -45,6 +47,23 @@ public:
     void Draw();
 
 private:
+    /**
+     * @brief What one instance needs to be drawn once its per-frame code has run.
+     */
+    struct InstanceDraw {
+        int sides{3};              //!< Number of corners, 3 to 100.
+        bool additive{false};      //!< Additive blending instead of alpha blending.
+        bool textured{false};      //!< Drawn with a texture.
+        bool useImage{false};      //!< The texture is the shape's "image" rather than the main texture.
+        bool border{false};        //!< Has an outline.
+        int iterations{1};         //!< Outline passes, 4 for a thick outline.
+        GLint fillFirst{0};        //!< First vertex of the fill in the fill mesh.
+        GLint outlineFirst{0};     //!< First vertex of the first outline pass in the outline mesh.
+        float borderColor[4]{};    //!< Outline color.
+    };
+
+    std::vector<InstanceDraw> m_instanceDraws; //!< Per-instance draw state, reused every frame.
+
     Renderer::Mesh m_outlineMesh; //!< The shape's border/outline mesh.
     Renderer::Mesh m_fillMesh; //!< The shape's color/texture mesh.
 
