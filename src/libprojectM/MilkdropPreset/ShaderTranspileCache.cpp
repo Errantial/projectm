@@ -777,6 +777,15 @@ struct ShaderTranspileCache::Impl
             return;
         }
 
+        // Read it back once. On Windows the first open of a new file waits for the
+        // antivirus scan (measured at about 7 ms per entry), and that wait belongs on
+        // this thread, not on the render thread's first hit. Later opens take 0.1 ms.
+        {
+            std::string readBack;
+            bool damaged = false;
+            ReadSmallFile(path, MaxEntryBytes, readBack, damaged);
+        }
+
         auto& entry = index[name];
         indexBytes -= std::min(indexBytes, entry.size);
         entry.size = contents.size();
