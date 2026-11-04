@@ -80,6 +80,13 @@ public:
                         const std::string& fragmentShaderSource);
 
     /**
+     * @brief Discards the current program object and creates a new, empty one.
+     * Use this to start from a clean program after a failed compile or link, so a
+     * retry does not inherit any state of the failed attempt.
+     */
+    void Reset();
+
+    /**
      * @brief Validates that the program can run in the current state.
      * @param validationMessage The error message if validation failed.
      * @return true if the shader program is valid and can run, false if it broken.

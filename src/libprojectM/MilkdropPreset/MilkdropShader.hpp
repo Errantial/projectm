@@ -88,6 +88,13 @@ private:
     void TranspileHLSLShader(const PresetState& presetState, std::string& program);
 
     /**
+     * @brief Builds the sampler and texsize declaration block inserted into the shader.
+     * @param presetState The preset state to pull the blur textures from.
+     * @return The declaration block, exactly as it is prepended to the shader source.
+     */
+    auto BuildDeclarationBlock(const PresetState& presetState) const -> std::string;
+
+    /**
      * @brief Updates the requested blur level if higher than before.
      * Also adds the required samplers.
      * @param requestedLevel The requested blur level.

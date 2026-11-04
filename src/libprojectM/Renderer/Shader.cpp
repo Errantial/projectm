@@ -57,6 +57,15 @@ void Shader::CompileProgram(const std::string& vertexShaderSource,
     throw ShaderException(linkError);
 }
 
+void Shader::Reset()
+{
+    if (m_shaderProgram)
+    {
+        glDeleteProgram(m_shaderProgram);
+    }
+    m_shaderProgram = glCreateProgram();
+}
+
 bool Shader::Validate(std::string& validationMessage) const
 {
     GLint result{GL_FALSE};

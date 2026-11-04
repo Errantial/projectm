@@ -1,6 +1,7 @@
 #include "MilkdropShader.hpp"
 
 #include "PresetState.hpp"
+#include "ShaderTranspileCache.hpp"
 #include "Utils.hpp"
 
 #include <MilkdropStaticShaders.hpp>
@@ -13,6 +14,8 @@
 #include <glm/mat4x4.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <regex>
 #include <set>
 
@@ -22,6 +25,120 @@ namespace MilkdropPreset {
 using libprojectM::MilkdropPreset::MilkdropStaticShaders;
 
 static auto floatRand = []() { return static_cast<float>(rand() % 7381) / 7380.0f; };
+
+namespace {
+
+/**
+ * @brief Wall-clock cost of the individual transpiler steps, for the debug output.
+ */
+struct TranspilePhases
+{
+    double preprocessMilliseconds{}; //!< HLSL preprocessor (the expensive part).
+    double stripMilliseconds{};      //!< Regex removal of old declarations and insertion of new ones.
+    double parseMilliseconds{};      //!< HLSL parsing.
+    double generateMilliseconds{};   //!< GLSL generation.
+};
+
+auto NowMilliseconds() -> double
+{
+    using Clock = std::chrono::steady_clock;
+    return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
+}
+
+auto FormatMilliseconds(double milliseconds) -> std::string
+{
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "%.2fms", milliseconds);
+    return buffer;
+}
+
+/**
+ * @brief Runs the complete HLSL to GLSL transpile.
+ *
+ * This is the expensive part of loading a preset shader: the HLSL preprocessor alone
+ * needs 30 to 56 ms for a typical preset shader. The result is a pure function of the
+ * arguments plus the generator version, which is what makes it cacheable.
+ *
+ * @param shaderTypeString "warp" or "composite", for messages.
+ * @param declarations The sampler and texsize declaration block to insert.
+ * @param program The preprocessed shader source, header and preset code included.
+ * @param phases Receives the time spent in each step.
+ * @return The generated GLSL fragment shader source.
+ */
+auto TranspileSource(const std::string& shaderTypeString,
+                     const std::string& declarations,
+                     const std::string& program,
+                     TranspilePhases& phases) -> std::string
+{
+    M4::GLSLGenerator generator;
+    M4::Allocator allocator;
+
+    M4::HLSLTree tree(&allocator);
+    M4::HLSLParser parser(&allocator, &tree);
+
+    // Preprocess define macros
+    std::string sourcePreprocessed;
+    double start = NowMilliseconds();
+    if (!parser.ApplyPreprocessor("", program.c_str(), program.size(), sourcePreprocessed))
+    {
+        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
+        throw Renderer::ShaderException("Error translating HLSL " + shaderTypeString + " shader: Preprocessing failed.");
+    }
+    phases.preprocessMilliseconds = NowMilliseconds() - start;
+
+    start = NowMilliseconds();
+
+    // Remove previous shader declarations
+    // ToDo: Quite some presets declare a sampler_state{} struct to change the wrap mode.
+    //       The below code causes invalid syntax as it leaves part of the expression.
+    //       Leaving it in causes HLSLParser to add "sampler_XYZ = sampler2D( <unknown expression> );"
+    //       in the main() function, which is also bad...
+    std::smatch matches;
+    while (std::regex_search(sourcePreprocessed, matches, std::regex("sampler(2D|3D|)(\\s+|\\().*")))
+    {
+        sourcePreprocessed.replace(matches.position(), matches.length(), "");
+    }
+
+    // Remove previous texsize declarations
+    while (std::regex_search(sourcePreprocessed, matches, std::regex("float4\\s+texsize_.*")))
+    {
+        sourcePreprocessed.replace(matches.position(), matches.length(), "");
+    }
+
+    // Now insert the sampler and texsize declarations on top.
+    sourcePreprocessed.insert(0, declarations);
+
+    phases.stripMilliseconds = NowMilliseconds() - start;
+
+    // Transpile from HLSL (aka preset shader aka DirectX shader) to GLSL (aka OpenGL shader lang)
+    // First, parse HLSL into a tree
+    start = NowMilliseconds();
+    if (!parser.Parse("", sourcePreprocessed.c_str(), sourcePreprocessed.size()))
+    {
+        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
+        LOG_DEBUG("[MilkdropShader] Failed preprocessed " + shaderTypeString + " shader code:\n" + sourcePreprocessed);
+        throw Renderer::ShaderException("[MilkdropShader] Error translating HLSL " + shaderTypeString + " shader: HLSL parsing failed.");
+    }
+    phases.parseMilliseconds = NowMilliseconds() - start;
+
+    // Then generate GLSL from the resulting parser tree
+    start = NowMilliseconds();
+    if (!generator.Generate(&tree, M4::GLSLGenerator::Target_FragmentShader,
+                            MilkdropStaticShaders::Get()->GetGlslGeneratorVersion(),
+                            "PS", M4::GLSLGenerator::Options(M4::GLSLGenerator::Flag_AlternateNanPropagation)))
+    {
+        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
+        LOG_DEBUG("[MilkdropShader] Failed preprocessed " + shaderTypeString + " shader code:\n" + sourcePreprocessed);
+        throw Renderer::ShaderException("[MilkdropShader] Error translating HLSL " + shaderTypeString + " shader: GLSL generating failed.\nSource:\n" + sourcePreprocessed);
+    }
+    phases.generateMilliseconds = NowMilliseconds() - start;
+
+    LOG_TRACE("[MilkdropShader] Transpiled GLSL " + shaderTypeString + " shader code:\n" + std::string(generator.GetResult()));
+
+    return std::string(generator.GetResult());
+}
+
+} // namespace
 
 MilkdropShader::MilkdropShader(ShaderType type)
     : m_type(type)
@@ -609,37 +726,107 @@ void MilkdropShader::TranspileHLSLShader(const PresetState& presetState, std::st
         shaderTypeString = "warp";
     }
 
-    M4::GLSLGenerator generator;
-    M4::Allocator allocator;
+    // The sampler and texsize declarations are the only part of the transpiler input
+    // besides the program text itself that changes between two loads of the same
+    // preset: they are empty for textures that could not be loaded, so a preset with
+    // missing texture files transpiles differently. Build them first, both to insert
+    // them and to make the cache key cover them.
+    std::string const declarations = BuildDeclarationBlock(presetState);
 
-    M4::HLSLTree tree(&allocator);
-    M4::HLSLParser parser(&allocator, &tree);
+    auto staticShaders = MilkdropStaticShaders::Get();
+    std::string const& vertexShaderSource = m_type == ShaderType::WarpShader
+                                                ? staticShaders->GetPresetWarpVertexShader()
+                                                : staticShaders->GetPresetCompVertexShader();
 
-    // Preprocess define macros
-    std::string sourcePreprocessed;
-    if (!parser.ApplyPreprocessor("", program.c_str(), program.size(), sourcePreprocessed))
+    auto& cache = ShaderTranspileCache::Instance();
+    std::string const cacheKey = cache.Enabled()
+                                     ? cache.Key(shaderTypeString,
+                                                 static_cast<int>(staticShaders->GetGlslGeneratorVersion()),
+                                                 static_cast<int>(m_maxBlurLevelRequired),
+                                                 declarations,
+                                                 program)
+                                     : std::string();
+
+    if (!cacheKey.empty())
     {
-        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
-        throw Renderer::ShaderException("Error translating HLSL " + shaderTypeString + " shader: Preprocessing failed.");
+        std::string cachedGlsl;
+        if (cache.Lookup(cacheKey, cachedGlsl))
+        {
+            try
+            {
+                double const compileStart = NowMilliseconds();
+                m_shader.CompileProgram(vertexShaderSource, cachedGlsl);
+                double const compileMilliseconds = NowMilliseconds() - compileStart;
+
+                if (cache.VerifyEnabled())
+                {
+                    // Testing the cache key, not loading quickly: do the whole work
+                    // again and complain loudly if the stored source is not the one
+                    // this build would generate.
+                    TranspilePhases phases;
+                    std::string const fresh = TranspileSource(shaderTypeString, declarations, program, phases);
+                    cache.RecordVerification(fresh == cachedGlsl, cacheKey);
+                    if (fresh != cachedGlsl)
+                    {
+                        m_shader.Reset();
+                        m_shader.CompileProgram(vertexShaderSource, fresh);
+                        cache.Store(cacheKey, fresh);
+                        return;
+                    }
+                }
+
+                if (cache.DebugEnabled())
+                {
+                    ShaderCacheDebugLog("[projectm shader cache] hit " + cacheKey.substr(0, 16) + " " +
+                                        shaderTypeString + " read+compile=" + FormatMilliseconds(compileMilliseconds));
+                }
+                return;
+            }
+            catch (const Renderer::ShaderException&)
+            {
+                // A damaged or out of date entry must cost one fresh transpile, never
+                // a broken picture: drop it, start from a clean program object and
+                // fall through to the normal path, which overwrites the entry.
+                cache.RecordCompileFailure(cacheKey);
+                cache.Discard(cacheKey);
+                m_shader.Reset();
+            }
+        }
     }
 
-    // Remove previous shader declarations
-    // ToDo: Quite some presets declare a sampler_state{} struct to change the wrap mode.
-    //       The below code causes invalid syntax as it leaves part of the expression.
-    //       Leaving it in causes HLSLParser to add "sampler_XYZ = sampler2D( <unknown expression> );"
-    //       in the main() function, which is also bad...
-    std::smatch matches;
-    while (std::regex_search(sourcePreprocessed, matches, std::regex("sampler(2D|3D|)(\\s+|\\().*")))
+    TranspilePhases phases;
+    double const transpileStart = NowMilliseconds();
+    std::string const glsl = TranspileSource(shaderTypeString, declarations, program, phases);
+    double const transpileMilliseconds = NowMilliseconds() - transpileStart;
+    cache.RecordTranspileTime(transpileMilliseconds);
+
+    // Now we have GLSL source for the preset shader program (hopefully it's valid!)
+    // Compile the preset shader fragment shader with the standard vertex shader and cross our fingers.
+    double const compileStart = NowMilliseconds();
+    m_shader.CompileProgram(vertexShaderSource, glsl);
+    double const compileMilliseconds = NowMilliseconds() - compileStart;
+
+    // Only a successful transpile and compile is worth keeping.
+    if (!cacheKey.empty())
     {
-        sourcePreprocessed.replace(matches.position(), matches.length(), "");
+        cache.Store(cacheKey, glsl);
     }
 
-    // Remove previous texsize declarations
-    while (std::regex_search(sourcePreprocessed, matches, std::regex("float4\\s+texsize_.*")))
+    if (cache.DebugEnabled())
     {
-        sourcePreprocessed.replace(matches.position(), matches.length(), "");
+        ShaderCacheDebugLog("[projectm shader cache] miss " + (cacheKey.empty() ? std::string("(disabled)") : cacheKey.substr(0, 16)) +
+                            " " + shaderTypeString +
+                            " preprocess=" + FormatMilliseconds(phases.preprocessMilliseconds) +
+                            " strip=" + FormatMilliseconds(phases.stripMilliseconds) +
+                            " parse=" + FormatMilliseconds(phases.parseMilliseconds) +
+                            " generate=" + FormatMilliseconds(phases.generateMilliseconds) +
+                            " transpile=" + FormatMilliseconds(transpileMilliseconds) +
+                            " driver=" + FormatMilliseconds(compileMilliseconds));
     }
+}
 
+auto MilkdropShader::BuildDeclarationBlock(const PresetState& presetState) const -> std::string
+{
     // Collect unique samplers and texsize uniforms
     std::set<std::string> samplerDeclarations;
     std::set<std::string> texSizeDeclarations;
@@ -659,47 +846,19 @@ void MilkdropShader::TranspileHLSLShader(const PresetState& presetState, std::st
         texSizeDeclarations.insert(desc.TexSizeDeclaration());
     }
 
-    // Now insert them on top.
-    for (const auto& texSizeDeclaration : texSizeDeclarations)
+    // The declarations used to be inserted at the front of the source one by one,
+    // which leaves the sets in reverse order. Reproduce that prefix exactly so the
+    // transpiler sees the same input as before and the cache key covers it.
+    std::string block;
+    for (auto it = samplerDeclarations.rbegin(); it != samplerDeclarations.rend(); ++it)
     {
-        sourcePreprocessed.insert(0, texSizeDeclaration);
+        block.append(*it);
     }
-    for (const auto& samplerDeclaration : samplerDeclarations)
+    for (auto it = texSizeDeclarations.rbegin(); it != texSizeDeclarations.rend(); ++it)
     {
-        sourcePreprocessed.insert(0, samplerDeclaration);
+        block.append(*it);
     }
-
-    // Transpile from HLSL (aka preset shader aka DirectX shader) to GLSL (aka OpenGL shader lang)
-    // First, parse HLSL into a tree
-    if (!parser.Parse("", sourcePreprocessed.c_str(), sourcePreprocessed.size()))
-    {
-        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
-        LOG_DEBUG("[MilkdropShader] Failed preprocessed " + shaderTypeString + " shader code:\n" + sourcePreprocessed);
-        throw Renderer::ShaderException("[MilkdropShader] Error translating HLSL " + shaderTypeString + " shader: HLSL parsing failed.");
-    }
-
-    // Then generate GLSL from the resulting parser tree
-    if (!generator.Generate(&tree, M4::GLSLGenerator::Target_FragmentShader,
-                            MilkdropStaticShaders::Get()->GetGlslGeneratorVersion(),
-                            "PS", M4::GLSLGenerator::Options(M4::GLSLGenerator::Flag_AlternateNanPropagation)))
-    {
-        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
-        LOG_DEBUG("[MilkdropShader] Failed preprocessed " + shaderTypeString + " shader code:\n" + sourcePreprocessed);
-        throw Renderer::ShaderException("[MilkdropShader] Error translating HLSL " + shaderTypeString + " shader: GLSL generating failed.\nSource:\n" + sourcePreprocessed);
-    }
-
-    LOG_TRACE("[MilkdropShader] Transpiled GLSL " + shaderTypeString + " shader code:\n" + std::string(generator.GetResult()));
-
-    // Now we have GLSL source for the preset shader program (hopefully it's valid!)
-    // Compile the preset shader fragment shader with the standard vertex shader and cross our fingers.
-    if (m_type == ShaderType::WarpShader)
-    {
-        m_shader.CompileProgram(MilkdropStaticShaders::Get()->GetPresetWarpVertexShader(), generator.GetResult());
-    }
-    else
-    {
-        m_shader.CompileProgram(MilkdropStaticShaders::Get()->GetPresetCompVertexShader(), generator.GetResult());
-    }
+    return block;
 }
 
 void MilkdropShader::UpdateMaxBlurLevel(BlurTexture::BlurLevel requestedLevel)

@@ -76,6 +76,8 @@ add_library(MilkdropPreset OBJECT
         PresetFileParser.hpp
         PresetState.cpp
         PresetState.hpp
+        ShaderTranspileCache.cpp
+        ShaderTranspileCache.hpp
         ShapePerFrameContext.cpp
         ShapePerFrameContext.hpp
         VideoEcho.cpp
@@ -132,6 +134,10 @@ target_include_directories(MilkdropPreset
         "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_BINARY_DIR}"
         )
+
+# The shader transpile cache keeps its files with std::filesystem, which needs C++17.
+# Only this target is raised, so the rest of libprojectM keeps the project's C++14.
+target_compile_features(MilkdropPreset PRIVATE cxx_std_17)
 
 target_link_libraries(MilkdropPreset
         PRIVATE
