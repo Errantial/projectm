@@ -17,6 +17,7 @@
  */
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace libprojectM {
@@ -33,11 +34,30 @@ namespace MilkdropPreset {
  * entry, including changes to the preset, the static shader header and the
  * generator itself.
  *
+ * A shader that this driver refused (or that could not be transpiled at all) is
+ * remembered as a "<sha256 hex>.reject" entry, keyed on the same inputs plus the
+ * GL vendor, renderer, version and GLSL version strings, so the next load goes
+ * straight to the fallback without transpiling or compiling it again. A driver
+ * update changes those strings and so invalidates every reject entry.
+ *
+ * Only reads happen on the caller's (render) thread. Every write, rename, mtime
+ * update, directory scan and prune runs on one background thread per process,
+ * which the calls below only hand work to. The thread runs while it has work and
+ * stops after a short idle period, so an idle process holds no extra thread.
+ *
+ * The directory is bounded by a byte budget (256 MiB by default) and pruned least
+ * recently used first: a hit refreshes the entry's modification time from the
+ * background thread, at most once per entry every ten minutes, so the modification
+ * time is the time of last use, also across processes that share the directory.
+ *
  * Configuration, read once on first use:
  * - `PROJECTM_SHADER_CACHE=0` disables the cache.
  * - `PROJECTM_SHADER_CACHE_DIR=<path>` overrides the cache directory.
+ * - `PROJECTM_SHADER_CACHE_MAX_MB=<n>` overrides the byte budget, for testing the
+ *   pruning without filling 256 MiB.
  * - `PROJECTM_SHADER_CACHE_VERIFY=1` transpiles every hit again and logs a loud
- *   error if the cached source differs (for testing the key, not for normal use).
+ *   error if the cached source differs, and re-checks every reject entry (for
+ *   testing the key, not for normal use).
  * - `PROJECTM_SHADER_CACHE_DEBUG=1` prints one line per lookup and a summary on exit.
  *
  * The default directory is `%LOCALAPPDATA%\projectm\shader-cache` on Windows and
@@ -52,6 +72,11 @@ public:
      * All existing entries are invalidated by a new value.
      */
     static constexpr int CacheFormatVersion = 1;
+
+    /**
+     * @brief The default byte budget of the cache directory.
+     */
+    static constexpr std::uint64_t DefaultMaxBytes = 256ull * 1024 * 1024;
 
     /**
      * @brief Returns the process-wide cache instance.
@@ -101,7 +126,8 @@ public:
              const std::string& program) const -> std::string;
 
     /**
-     * @brief Reads a cached entry.
+     * @brief Reads a cached entry. Runs on the caller's thread; a hit also asks the
+     *        background thread to refresh the entry's recency.
      * @param key The entry key, as returned by Key().
      * @param glsl Receives the stored GLSL source on a hit.
      * @return true if the entry existed and looked like GLSL source, false otherwise.
@@ -109,7 +135,7 @@ public:
     auto Lookup(const std::string& key, std::string& glsl) -> bool;
 
     /**
-     * @brief Stores a successfully transpiled shader.
+     * @brief Stores a successfully transpiled shader. Only queues the write.
      * Failures are counted and otherwise ignored.
      * @param key The entry key, as returned by Key().
      * @param glsl The generated GLSL source.
@@ -117,10 +143,34 @@ public:
     void Store(const std::string& key, const std::string& glsl);
 
     /**
-     * @brief Removes an entry, e.g. after its GLSL failed to compile.
+     * @brief Removes an entry, e.g. after its GLSL failed to compile. Only queues it.
      * @param key The entry key to remove.
      */
     void Discard(const std::string& key);
+
+    /**
+     * @brief Returns whether this shader is known to fail on this driver.
+     * @param key The entry key, as returned by Key().
+     * @param driver The GL vendor, renderer, version and GLSL version strings.
+     * @param reason Receives the stored reason on a hit.
+     * @return true if a reject entry for this key and driver exists.
+     */
+    auto LookupRejected(const std::string& key, const std::string& driver, std::string& reason) -> bool;
+
+    /**
+     * @brief Remembers that this shader failed on this driver. Only queues the write.
+     * @param key The entry key, as returned by Key().
+     * @param driver The GL vendor, renderer, version and GLSL version strings.
+     * @param reason Where it failed ("transpile" or "driver") and the first line of
+     *               the error, for the log.
+     */
+    void StoreRejected(const std::string& key, const std::string& driver, const std::string& reason);
+
+    /**
+     * @brief Forgets a reject entry, e.g. when verify mode found that the shader
+     *        compiles after all.
+     */
+    void DiscardRejected(const std::string& key, const std::string& driver);
 
     /**
      * @brief Records the outcome of a verification transpile.
@@ -128,6 +178,13 @@ public:
      * @param key The entry key that was verified.
      */
     void RecordVerification(bool matched, const std::string& key);
+
+    /**
+     * @brief Records the outcome of re-checking a reject entry in verify mode.
+     * @param stillFails true if the shader failed again, as the entry says.
+     * @param key The entry key that was verified.
+     */
+    void RecordRejectVerification(bool stillFails, const std::string& key);
 
     /**
      * @brief Records that compiling a cached entry failed and the shader was redone.
@@ -142,22 +199,19 @@ public:
      */
     void RecordTranspileTime(double milliseconds);
 
+    /**
+     * @brief Waits until the background thread has finished the work queued so far,
+     *        or the timeout passed. For tests and tools; never needed for correctness.
+     * @return true if the queue is empty.
+     */
+    auto Flush(int timeoutMilliseconds) -> bool;
+
 private:
     ShaderTranspileCache();
     ~ShaderTranspileCache();
 
     ShaderTranspileCache(const ShaderTranspileCache&) = delete;
     auto operator=(const ShaderTranspileCache&) -> ShaderTranspileCache& = delete;
-
-    /**
-     * @brief Deletes the oldest entries if the cache is over its size or count limit.
-     */
-    void PruneIfNeeded();
-
-    /**
-     * @brief Writes the summary line. Called once at process exit when debugging.
-     */
-    void PrintSummary();
 
     struct Impl;
     Impl* m_impl;

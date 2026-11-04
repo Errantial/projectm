@@ -7,14 +7,19 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(_WIN32)
@@ -28,17 +33,39 @@ namespace MilkdropPreset {
 
 namespace {
 
-/// Largest entry we ever read back. Generated preset GLSL is 20 to 200 KB.
+/// Largest entry we ever read back. Generated preset GLSL is 5 to 12 KB.
 constexpr std::uintmax_t MaxEntryBytes = 4 * 1024 * 1024;
 
-/// Entries kept before the oldest are pruned.
-constexpr std::size_t MaxEntries = 4096;
+/// Largest reject entry we ever read back: a header, the driver strings and a reason.
+constexpr std::uintmax_t MaxRejectBytes = 64 * 1024;
 
-/// Bytes kept before the oldest entries are pruned.
-constexpr std::uintmax_t MaxBytes = 64 * 1024 * 1024;
+/// A prune removes entries until the directory is at this fraction of the budget,
+/// so a full cache is not pruned again on the very next store.
+constexpr double PruneTargetFraction = 0.9;
 
-/// How many stores pass between two prune passes.
-constexpr std::uint64_t StoresBetweenPrunes = 64;
+/// Stores between two directory rescans. The worker keeps its own running total;
+/// a rescan picks up entries other processes added and removed in the meantime.
+constexpr std::uint64_t StoresBetweenRescans = 1024;
+
+/// Queued work the caller threads may hand the worker before new work is dropped.
+/// A dropped store is only a later miss, so this bounds memory, nothing else.
+constexpr std::size_t MaxQueuedBytes = 32 * 1024 * 1024;
+constexpr std::size_t MaxQueuedJobs = 65536;
+
+/// A hit refreshes an entry's modification time at most this often.
+constexpr auto TouchInterval = std::chrono::minutes(10);
+
+/// The worker stops after this long without work, and starts again on demand.
+constexpr auto WorkerIdleExit = std::chrono::seconds(5);
+
+/// At process exit, queued writes get this long to reach the disk; the rest is dropped.
+constexpr auto ShutdownDrain = std::chrono::seconds(2);
+
+/// Temporary files older than this are leftovers of a process that died mid-write.
+constexpr auto StaleTemporary = std::chrono::hours(1);
+
+/// First line of a reject entry.
+constexpr const char* RejectMagic = "projectm-shader-reject 1";
 
 /**
  * @brief Minimal SHA-256, used to name cache entries.
@@ -259,29 +286,131 @@ auto NowMilliseconds() -> double
     return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
 }
 
+
+/// Reads a whole file of at most `limit` bytes. False on any error or an empty file.
+auto ReadSmallFile(const std::filesystem::path& path, std::uintmax_t limit, std::string& contents, bool& damaged) -> bool
+{
+    damaged = false;
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error)
+    {
+        return false;
+    }
+    if (size == 0 || size > limit)
+    {
+        // An empty or absurdly large file can only be garbage.
+        damaged = true;
+        return false;
+    }
+
+    std::ifstream file(path, std::ios::binary);
+    contents.resize(static_cast<std::size_t>(size));
+    if (!file.read(&contents[0], static_cast<std::streamsize>(size)))
+    {
+        damaged = true;
+        contents.clear();
+        return false;
+    }
+    return true;
+}
+
+/// The first line of a possibly multi-line message.
+auto FirstLine(const std::string& text) -> std::string
+{
+    const auto end = text.find_first_of("\r\n");
+    return end == std::string::npos ? text : text.substr(0, end);
+}
+
 } // namespace
 
+/**
+ * @brief The cache's state.
+ *
+ * Caller threads (the render thread) only read entries and queue work under
+ * `mutex`. One worker thread at a time does every write, rename, mtime update,
+ * directory scan and prune. The members marked "worker only" are touched by the
+ * worker alone; a new worker is only started after the previous one has been
+ * joined, which orders their accesses.
+ */
 struct ShaderTranspileCache::Impl
 {
+    struct Job
+    {
+        enum class Kind
+        {
+            Store,  //!< Write `payload` to `name`, atomically.
+            Touch,  //!< Refresh the modification time of `name`.
+            Discard //!< Remove `name`.
+        };
+
+        Kind kind{Kind::Store};
+        std::string name;
+        std::shared_ptr<const std::string> payload;
+    };
+
+    struct IndexEntry
+    {
+        std::uintmax_t size{};
+        std::filesystem::file_time_type modified{};
+    };
+
     bool enabled{false};
     bool verify{false};
     bool debug{false};
     std::string directory;
     std::string disabledReason;
+    std::uint64_t maxBytes{DefaultMaxBytes};
 
+    // Shared between the caller threads and the worker, guarded by `mutex`.
     std::mutex mutex;
+    std::condition_variable wake; //!< The worker waits on it for work or the stop.
+    std::condition_variable idle; //!< Flush() and shutdown wait on it for the worker.
+    std::deque<Job> queue;
+    std::size_t queuedBytes{};
+    //! Stores queued but not yet on disk, so a lookup in the meantime still hits.
+    std::unordered_map<std::string, std::shared_ptr<const std::string>> pending;
+    //! When this process last asked for an entry's mtime to be refreshed.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> touchRequested;
+    std::thread worker;
+    bool workerRunning{false};
+    bool workerBusy{false};
+    bool stopping{false};
+    bool startupScanDone{false};
+    std::chrono::steady_clock::time_point stopDeadline{};
+
+    // Counters, guarded by `mutex`.
     std::uint64_t hits{};
     std::uint64_t misses{};
     std::uint64_t unreadable{};
     std::uint64_t storeFailures{};
     std::uint64_t compileFailures{};
     std::uint64_t verifyMismatches{};
+    std::uint64_t rejectHits{};
+    std::uint64_t rejectsStored{};
+    std::uint64_t rejectVerifyMismatches{};
     std::uint64_t entriesPruned{};
     std::uint64_t stores{};
+    std::uint64_t touches{};
+    std::uint64_t droppedJobs{};
+    std::uint64_t scans{};
+    std::uint64_t lastScanEntries{};
+    std::uint64_t lastScanBytes{};
+    std::uint64_t startupEntries{};
+    std::uint64_t startupBytes{};
     double hitMilliseconds{};
+    double maxHitMilliseconds{};
     double storeMilliseconds{};
     double transpileMilliseconds{};
+    double scanMilliseconds{};
+    double startupScanMilliseconds{};
     bool compileFailureLogged{false};
+
+    // Worker only.
+    std::unordered_map<std::string, IndexEntry> index;
+    std::uintmax_t indexBytes{};
+    std::uint64_t storesSinceScan{};
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> lastTouched;
 
     Impl()
     {
@@ -297,6 +426,17 @@ struct ShaderTranspileCache::Impl
             disabledReason = "PROJECTM_SHADER_CACHE is set to a false value";
             LogDisabled();
             return;
+        }
+
+        const std::string budget = EnvValue("PROJECTM_SHADER_CACHE_MAX_MB");
+        if (!budget.empty())
+        {
+            char* end = nullptr;
+            const unsigned long long megabytes = std::strtoull(budget.c_str(), &end, 10);
+            if (end != nullptr && *end == '\0' && megabytes > 0)
+            {
+                maxBytes = static_cast<std::uint64_t>(megabytes) * 1024 * 1024;
+            }
         }
 
         std::filesystem::path cacheDirectory;
@@ -348,13 +488,49 @@ struct ShaderTranspileCache::Impl
         if (debug)
         {
             ShaderCacheDebugLog("[projectm shader cache] enabled, directory " + directory +
+                                ", budget " + std::to_string(maxBytes / (1024 * 1024)) + " MiB" +
                                 (verify ? " (verify mode: every hit is transpiled again)" : ""));
         }
+
+        // Prune at start: the worker's first job is the directory scan, which also
+        // deletes stale temporary files and trims the directory to the budget.
+        std::lock_guard<std::mutex> lock(mutex);
+        StartWorkerLocked();
     }
 
-    ~Impl()
+    /**
+     * @brief Stops the worker, giving queued writes ShutdownDrain to finish.
+     * @return true if the worker is gone and the state may be freed.
+     */
+    auto Shutdown() -> bool
     {
+        std::unique_lock<std::mutex> lock(mutex);
+        stopping = true;
+        stopDeadline = std::chrono::steady_clock::now() + ShutdownDrain;
+        wake.notify_all();
+        if (workerRunning)
+        {
+            idle.wait_until(lock, stopDeadline + std::chrono::milliseconds(500), [this] { return !workerRunning; });
+        }
+        const bool finished = !workerRunning;
+        lock.unlock();
+
+        if (worker.joinable())
+        {
+            if (finished)
+            {
+                worker.join();
+            }
+            else
+            {
+                // Stuck on a slow disk: let it go with the process rather than hang
+                // the exit. The state stays allocated for it.
+                worker.detach();
+            }
+        }
+
         PrintSummary();
+        return finished;
     }
 
     void LogDisabled() const
@@ -365,92 +541,331 @@ struct ShaderTranspileCache::Impl
         }
     }
 
-    auto EnabledEntryPath(const std::string& key) const -> std::filesystem::path
+    auto EntryPath(const std::string& name) const -> std::filesystem::path
     {
-        return std::filesystem::path(directory) / (key + ".glsl");
+        return std::filesystem::path(directory) / name;
     }
 
-    void PrintSummary()
+    /// Starts the worker unless one is running. Called with `mutex` held.
+    void StartWorkerLocked()
     {
-        if (!enabled || !debug)
+        if (workerRunning || stopping)
+        {
+            wake.notify_one();
+            return;
+        }
+        if (worker.joinable())
+        {
+            // The previous worker has set workerRunning to false and is returning;
+            // it needs no lock to do so.
+            worker.join();
+        }
+        try
+        {
+            worker = std::thread([this] { Run(); });
+            workerRunning = true;
+        }
+        catch (...)
+        {
+            // No thread: the queued work stays queued and is retried with the next
+            // job. Nothing on the caller's thread waits for it.
+        }
+    }
+
+    /// Queues a job for the worker. Called with `mutex` held.
+    void EnqueueLocked(Job job)
+    {
+        if (stopping)
         {
             return;
         }
-
-        const std::uint64_t lookups = hits + misses;
-        const double hitRate = lookups == 0 ? 0.0 : (100.0 * static_cast<double>(hits) / static_cast<double>(lookups));
-        const double averageMiss = misses == 0 ? 0.0 : transpileMilliseconds / static_cast<double>(misses);
-        const double estimatedSaved = static_cast<double>(hits) * averageMiss - hitMilliseconds;
-
-        char line[512];
-        std::snprintf(line, sizeof(line),
-                      "[projectm shader cache] summary: directory=%s lookups=%llu hits=%llu misses=%llu hit-rate=%.1f%% "
-                      "unreadable=%llu store-failures=%llu compile-failures=%llu verify-mismatches=%llu pruned=%llu",
-                      directory.c_str(),
-                      static_cast<unsigned long long>(lookups),
-                      static_cast<unsigned long long>(hits),
-                      static_cast<unsigned long long>(misses),
-                      hitRate,
-                      static_cast<unsigned long long>(unreadable),
-                      static_cast<unsigned long long>(storeFailures),
-                      static_cast<unsigned long long>(compileFailures),
-                      static_cast<unsigned long long>(verifyMismatches),
-                      static_cast<unsigned long long>(entriesPruned));
-        ShaderCacheDebugLog(line);
-
-        std::snprintf(line, sizeof(line),
-                      "[projectm shader cache] timings: hit-read=%.1fms store=%.1fms transpiled=%.1fms over %llu misses "
-                      "(%.1fms each) estimated-saved=%.1fms",
-                      hitMilliseconds,
-                      storeMilliseconds,
-                      transpileMilliseconds,
-                      static_cast<unsigned long long>(misses),
-                      averageMiss,
-                      estimatedSaved);
-        ShaderCacheDebugLog(line);
+        const std::size_t bytes = job.payload ? job.payload->size() : 0;
+        if (queue.size() >= MaxQueuedJobs || queuedBytes + bytes > MaxQueuedBytes)
+        {
+            ++droppedJobs;
+            return;
+        }
+        if (job.kind == Job::Kind::Store)
+        {
+            pending[job.name] = job.payload;
+        }
+        else if (job.kind == Job::Kind::Discard)
+        {
+            pending.erase(job.name);
+            touchRequested.erase(job.name);
+        }
+        queuedBytes += bytes;
+        queue.push_back(std::move(job));
+        StartWorkerLocked();
     }
 
-    void PruneIfNeeded()
+    /// Asks the worker to refresh an entry's recency, at most every TouchInterval.
+    /// Called with `mutex` held; costs a map lookup, no I/O.
+    void RequestTouchLocked(const std::string& name)
     {
-        if (stores == 0 || stores % StoresBetweenPrunes != 0)
+        const auto now = std::chrono::steady_clock::now();
+        auto found = touchRequested.find(name);
+        if (found != touchRequested.end() && now - found->second < TouchInterval)
         {
             return;
         }
+        touchRequested[name] = now;
+        Job job;
+        job.kind = Job::Kind::Touch;
+        job.name = name;
+        EnqueueLocked(std::move(job));
+    }
+
+    /// Returns a queued store's payload, if one is waiting for the worker.
+    /// Called with `mutex` held.
+    auto PendingLocked(const std::string& name) const -> std::shared_ptr<const std::string>
+    {
+        auto found = pending.find(name);
+        return found == pending.end() ? nullptr : found->second;
+    }
+
+    /// The worker thread: the startup scan, then every queued job in order.
+    void Run()
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!startupScanDone && !stopping)
+        {
+            lock.unlock();
+            const double start = NowMilliseconds();
+            try
+            {
+                ScanAndPrune();
+            }
+            catch (...)
+            {
+            }
+            const double elapsed = NowMilliseconds() - start;
+            lock.lock();
+            startupScanDone = true;
+            startupScanMilliseconds = elapsed;
+            startupEntries = lastScanEntries;
+            startupBytes = lastScanBytes;
+        }
+
+        while (true)
+        {
+            if (queue.empty())
+            {
+                idle.notify_all();
+                if (stopping)
+                {
+                    break;
+                }
+                wake.wait_for(lock, WorkerIdleExit, [this] { return !queue.empty() || stopping; });
+                if (queue.empty())
+                {
+                    break;
+                }
+            }
+            if (stopping && std::chrono::steady_clock::now() > stopDeadline)
+            {
+                // Out of time at exit: what is left is only a later miss.
+                droppedJobs += queue.size();
+                queue.clear();
+                pending.clear();
+                queuedBytes = 0;
+                break;
+            }
+
+            Job job = std::move(queue.front());
+            queue.pop_front();
+            queuedBytes -= job.payload ? job.payload->size() : 0;
+            workerBusy = true;
+            lock.unlock();
+
+            try
+            {
+                Process(job);
+            }
+            catch (...)
+            {
+                // The cache is only a cache: nothing it does may end the process.
+            }
+
+            lock.lock();
+            workerBusy = false;
+            if (job.kind == Job::Kind::Store)
+            {
+                auto found = pending.find(job.name);
+                if (found != pending.end() && found->second == job.payload)
+                {
+                    pending.erase(found);
+                }
+            }
+        }
+
+        workerRunning = false;
+        idle.notify_all();
+    }
+
+    /// Does one job. Worker only, without `mutex`, except to update counters.
+    void Process(const Job& job)
+    {
+        switch (job.kind)
+        {
+            case Job::Kind::Store:
+                Write(job.name, *job.payload);
+                break;
+
+            case Job::Kind::Touch:
+                Touch(job.name);
+                break;
+
+            case Job::Kind::Discard:
+            {
+                std::error_code error;
+                std::filesystem::remove(EntryPath(job.name), error);
+                auto found = index.find(job.name);
+                if (found != index.end())
+                {
+                    indexBytes -= std::min(indexBytes, found->second.size);
+                    index.erase(found);
+                }
+                break;
+            }
+        }
+    }
+
+    void Write(const std::string& name, const std::string& contents)
+    {
+        const double start = NowMilliseconds();
+        const auto path = EntryPath(name);
+        const auto temporary = std::filesystem::path(path.string() + ".tmp." + std::to_string(ProcessId()));
+
+        bool wrote = false;
+        {
+            std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+            if (file)
+            {
+                file.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+                file.flush();
+                wrote = file.good();
+                file.close();
+            }
+        }
+
+        std::error_code error;
+        if (wrote)
+        {
+            std::filesystem::rename(temporary, path, error);
+            if (error)
+            {
+                // Windows refuses to rename onto an existing file on some file systems.
+                std::error_code removeError;
+                std::filesystem::remove(path, removeError);
+                error.clear();
+                std::filesystem::rename(temporary, path, error);
+            }
+        }
+
+        if (!wrote || error)
+        {
+            std::error_code removeError;
+            std::filesystem::remove(temporary, removeError);
+            std::lock_guard<std::mutex> lock(mutex);
+            ++storeFailures;
+            if (storeFailures == 1 && debug)
+            {
+                ShaderCacheDebugLog("[projectm shader cache] cannot write " + path.string() +
+                                    (error ? ": " + error.message() : std::string()));
+            }
+            return;
+        }
+
+        auto& entry = index[name];
+        indexBytes -= std::min(indexBytes, entry.size);
+        entry.size = contents.size();
+        entry.modified = std::filesystem::file_time_type::clock::now();
+        indexBytes += entry.size;
+        ++storesSinceScan;
+        lastTouched[name] = std::chrono::steady_clock::now();
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            storeMilliseconds += NowMilliseconds() - start;
+            ++stores;
+        }
+
+        if (indexBytes > maxBytes || storesSinceScan >= StoresBetweenRescans)
+        {
+            ScanAndPrune();
+        }
+    }
+
+    void Touch(const std::string& name)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        auto found = lastTouched.find(name);
+        if (found != lastTouched.end() && now - found->second < TouchInterval)
+        {
+            return;
+        }
+        lastTouched[name] = now;
+
+        const auto modified = std::filesystem::file_time_type::clock::now();
+        std::error_code error;
+        std::filesystem::last_write_time(EntryPath(name), modified, error);
+        if (error)
+        {
+            // Gone (pruned by another process) or not writable: nothing to refresh.
+            return;
+        }
+        auto entry = index.find(name);
+        if (entry != index.end())
+        {
+            entry->second.modified = modified;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        ++touches;
+    }
+
+    /**
+     * @brief Reads the directory, deletes stale temporary files and, if the entries
+     *        are over the budget, deletes the least recently used ones.
+     *
+     * The modification time is the time of last use: a store sets it, and a hit
+     * refreshes it through Touch(). Another process pruning the same directory at
+     * the same time only makes some removals find nothing to remove.
+     */
+    void ScanAndPrune()
+    {
+        const double start = NowMilliseconds();
 
         struct Entry
         {
-            std::filesystem::path path;
+            std::string name;
             std::filesystem::file_time_type modified;
             std::uintmax_t size{};
         };
 
         std::vector<Entry> entries;
         std::uintmax_t totalBytes = 0;
+        const auto now = std::filesystem::file_time_type::clock::now();
 
         std::error_code error;
-        for (const auto& item : std::filesystem::directory_iterator(directory, error))
+        std::filesystem::directory_iterator item(directory, error);
+        const std::filesystem::directory_iterator end;
+        for (; !error && item != end; item.increment(error))
         {
-            if (error)
-            {
-                break;
-            }
-            const auto& path = item.path();
-            const std::string name = path.filename().string();
-            if (name.empty())
-            {
-                continue;
-            }
-            const bool isEntry = name.size() > 5 && name.compare(name.size() - 5, 5, ".glsl") == 0;
+            const std::string name = item->path().filename().string();
             const bool isTemporary = name.find(".tmp") != std::string::npos;
+            const bool isEntry = !isTemporary &&
+                                 ((name.size() > 5 && name.compare(name.size() - 5, 5, ".glsl") == 0) ||
+                                  (name.size() > 7 && name.compare(name.size() - 7, 7, ".reject") == 0));
 
             std::error_code entryError;
             if (isTemporary)
             {
                 // Leftover from a process that died between write and rename.
-                const auto modified = std::filesystem::last_write_time(path, entryError);
-                if (!entryError && std::filesystem::file_time_type::clock::now() - modified > std::chrono::hours(1))
+                const auto modified = item->last_write_time(entryError);
+                if (!entryError && now - modified > StaleTemporary)
                 {
-                    std::filesystem::remove(path, entryError);
+                    std::filesystem::remove(item->path(), entryError);
                 }
                 continue;
             }
@@ -460,13 +875,13 @@ struct ShaderTranspileCache::Impl
             }
 
             Entry entry;
-            entry.path = path;
-            entry.modified = std::filesystem::last_write_time(path, entryError);
+            entry.name = name;
+            entry.modified = item->last_write_time(entryError);
             if (entryError)
             {
                 continue;
             }
-            entry.size = std::filesystem::file_size(path, entryError);
+            entry.size = item->file_size(entryError);
             if (entryError)
             {
                 continue;
@@ -475,30 +890,130 @@ struct ShaderTranspileCache::Impl
             entries.push_back(std::move(entry));
         }
 
-        if (entries.size() <= MaxEntries && totalBytes <= MaxBytes)
+        std::uint64_t removed = 0;
+        if (totalBytes > maxBytes)
+        {
+            std::sort(entries.begin(), entries.end(), [](const Entry& left, const Entry& right) {
+                return left.modified < right.modified;
+            });
+
+            const auto target = static_cast<std::uintmax_t>(static_cast<double>(maxBytes) * PruneTargetFraction);
+            std::size_t at = 0;
+            for (; at < entries.size() && totalBytes > target; ++at)
+            {
+                std::error_code removeError;
+                std::filesystem::remove(EntryPath(entries[at].name), removeError);
+                if (!removeError)
+                {
+                    // Removed here, or already removed by another process: gone either way.
+                    totalBytes -= std::min(totalBytes, entries[at].size);
+                    ++removed;
+                    lastTouched.erase(entries[at].name);
+                }
+            }
+            entries.erase(entries.begin(), entries.begin() + static_cast<std::ptrdiff_t>(at));
+        }
+
+        index.clear();
+        for (auto& entry : entries)
+        {
+            index[entry.name] = IndexEntry{entry.size, entry.modified};
+        }
+        indexBytes = totalBytes;
+        storesSinceScan = 0;
+
+        const double elapsed = NowMilliseconds() - start;
+        std::lock_guard<std::mutex> lock(mutex);
+        ++scans;
+        scanMilliseconds += elapsed;
+        lastScanEntries = entries.size();
+        lastScanBytes = totalBytes;
+        entriesPruned += removed;
+        if (debug && removed > 0)
+        {
+            ShaderCacheDebugLog("[projectm shader cache] pruned " + std::to_string(removed) + " least recently used entries, " +
+                                std::to_string(entries.size()) + " entries and " + std::to_string(totalBytes) + " bytes kept");
+        }
+    }
+
+    void PrintSummary()
+    {
+        if (!enabled || !debug)
         {
             return;
         }
 
-        std::sort(entries.begin(), entries.end(), [](const Entry& left, const Entry& right) {
-            return left.modified < right.modified;
-        });
+        std::lock_guard<std::mutex> lock(mutex);
+        const std::uint64_t lookups = hits + misses;
+        const double hitRate = lookups == 0 ? 0.0 : (100.0 * static_cast<double>(hits) / static_cast<double>(lookups));
+        const double averageMiss = misses == 0 ? 0.0 : transpileMilliseconds / static_cast<double>(misses);
+        const double estimatedSaved = static_cast<double>(hits) * averageMiss - hitMilliseconds;
 
-        std::size_t index = 0;
-        while (index < entries.size() &&
-               (entries.size() - index > MaxEntries || totalBytes > MaxBytes))
-        {
-            std::error_code removeError;
-            if (std::filesystem::remove(entries[index].path, removeError))
-            {
-                totalBytes -= std::min(totalBytes, entries[index].size);
-                ++entriesPruned;
-            }
-            ++index;
-        }
+        char line[768];
+        std::snprintf(line, sizeof(line),
+                      "[projectm shader cache] summary: directory=%s lookups=%llu hits=%llu misses=%llu hit-rate=%.1f%% "
+                      "unreadable=%llu store-failures=%llu compile-failures=%llu verify-mismatches=%llu "
+                      "reject-hits=%llu rejects-stored=%llu reject-verify-mismatches=%llu pruned=%llu",
+                      directory.c_str(),
+                      static_cast<unsigned long long>(lookups),
+                      static_cast<unsigned long long>(hits),
+                      static_cast<unsigned long long>(misses),
+                      hitRate,
+                      static_cast<unsigned long long>(unreadable),
+                      static_cast<unsigned long long>(storeFailures),
+                      static_cast<unsigned long long>(compileFailures),
+                      static_cast<unsigned long long>(verifyMismatches),
+                      static_cast<unsigned long long>(rejectHits),
+                      static_cast<unsigned long long>(rejectsStored),
+                      static_cast<unsigned long long>(rejectVerifyMismatches),
+                      static_cast<unsigned long long>(entriesPruned));
+        ShaderCacheDebugLog(line);
 
-        ShaderCacheDebugLog("[projectm shader cache] pruned " + std::to_string(index) + " entries, " +
-                            std::to_string(totalBytes) + " bytes kept");
+        std::snprintf(line, sizeof(line),
+                      "[projectm shader cache] timings: hit-read=%.1fms (max %.2fms) transpiled=%.1fms over %llu misses "
+                      "(%.1fms each) estimated-saved=%.1fms",
+                      hitMilliseconds,
+                      maxHitMilliseconds,
+                      transpileMilliseconds,
+                      static_cast<unsigned long long>(misses),
+                      averageMiss,
+                      estimatedSaved);
+        ShaderCacheDebugLog(line);
+
+        std::snprintf(line, sizeof(line),
+                      "[projectm shader cache] worker: stores=%llu (%.1fms) touches=%llu dropped=%llu scans=%llu (%.1fms) "
+                      "startup-scan=%.1fms startup-entries=%llu startup-bytes=%llu entries=%llu bytes=%llu budget=%llu",
+                      static_cast<unsigned long long>(stores),
+                      storeMilliseconds,
+                      static_cast<unsigned long long>(touches),
+                      static_cast<unsigned long long>(droppedJobs),
+                      static_cast<unsigned long long>(scans),
+                      scanMilliseconds,
+                      startupScanMilliseconds,
+                      static_cast<unsigned long long>(startupEntries),
+                      static_cast<unsigned long long>(startupBytes),
+                      static_cast<unsigned long long>(lastScanEntries),
+                      static_cast<unsigned long long>(lastScanBytes),
+                      static_cast<unsigned long long>(maxBytes));
+        ShaderCacheDebugLog(line);
+    }
+
+    /// Records one hit's read time. Called with `mutex` held.
+    void RecordHitLocked(double milliseconds)
+    {
+        ++hits;
+        hitMilliseconds += milliseconds;
+        maxHitMilliseconds = std::max(maxHitMilliseconds, milliseconds);
+    }
+
+    /// The reject entry's name: the transpile key and the driver, hashed together.
+    static auto RejectName(const std::string& key, const std::string& driver) -> std::string
+    {
+        Sha256 hash;
+        UpdateString(hash, "projectm-preset-shader-reject");
+        UpdateString(hash, key);
+        UpdateString(hash, driver);
+        return hash.FinalHex() + ".reject";
     }
 };
 
@@ -515,7 +1030,11 @@ ShaderTranspileCache::ShaderTranspileCache()
 
 ShaderTranspileCache::~ShaderTranspileCache()
 {
-    delete m_impl;
+    if (m_impl->Shutdown())
+    {
+        delete m_impl;
+    }
+    // Otherwise a detached worker still uses it; the process is exiting anyway.
 }
 
 auto ShaderTranspileCache::Enabled() const -> bool
@@ -569,50 +1088,44 @@ auto ShaderTranspileCache::Lookup(const std::string& key, std::string& glsl) -> 
     }
 
     const double start = NowMilliseconds();
-    const auto path = m_impl->EnabledEntryPath(key);
+    const std::string name = key + ".glsl";
 
-    std::error_code error;
-    const auto size = std::filesystem::file_size(path, error);
-    if (error || size == 0 || size > MaxEntryBytes)
     {
         std::lock_guard<std::mutex> lock(m_impl->mutex);
-        if (!error)
+        if (auto pending = m_impl->PendingLocked(name))
         {
-            // An empty or absurdly large file can only be garbage.
+            // Stored by this process a moment ago, not yet on disk.
+            glsl = *pending;
+            m_impl->RecordHitLocked(NowMilliseconds() - start);
+            return true;
+        }
+    }
+
+    std::string contents;
+    bool damaged = false;
+    const bool read = ReadSmallFile(m_impl->EntryPath(name), MaxEntryBytes, contents, damaged);
+
+    // Cheap sanity check: every generated preset shader has a main() function.
+    // Anything else is a damaged entry, and a miss costs only one transpile.
+    if (read && contents.find("void main()") == std::string::npos)
+    {
+        damaged = true;
+    }
+
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (!read || damaged)
+    {
+        if (damaged)
+        {
             ++m_impl->unreadable;
         }
         ++m_impl->misses;
         return false;
     }
 
-    std::ifstream file(path, std::ios::binary);
-    std::string contents;
-    contents.resize(static_cast<std::size_t>(size));
-    if (!file.read(&contents[0], static_cast<std::streamsize>(size)))
-    {
-        std::lock_guard<std::mutex> lock(m_impl->mutex);
-        ++m_impl->unreadable;
-        ++m_impl->misses;
-        return false;
-    }
-    file.close();
-
-    // Cheap sanity check: every generated preset shader has a main() function.
-    // Anything else is a damaged entry, and a miss costs only one transpile.
-    if (contents.find("void main()") == std::string::npos)
-    {
-        std::lock_guard<std::mutex> lock(m_impl->mutex);
-        ++m_impl->unreadable;
-        ++m_impl->misses;
-        return false;
-    }
-
     glsl = std::move(contents);
-
-    const double elapsed = NowMilliseconds() - start;
-    std::lock_guard<std::mutex> lock(m_impl->mutex);
-    ++m_impl->hits;
-    m_impl->hitMilliseconds += elapsed;
+    m_impl->RecordHitLocked(NowMilliseconds() - start);
+    m_impl->RequestTouchLocked(name);
     return true;
 }
 
@@ -623,57 +1136,13 @@ void ShaderTranspileCache::Store(const std::string& key, const std::string& glsl
         return;
     }
 
-    const double start = NowMilliseconds();
+    Impl::Job job;
+    job.kind = Impl::Job::Kind::Store;
+    job.name = key + ".glsl";
+    job.payload = std::make_shared<const std::string>(glsl);
 
-    // The whole write is under the lock: the temporary name is per process, so two
-    // threads storing at once would otherwise share it.
     std::lock_guard<std::mutex> lock(m_impl->mutex);
-
-    const auto path = m_impl->EnabledEntryPath(key);
-    const auto temporary = std::filesystem::path(path.string() + ".tmp." + std::to_string(ProcessId()));
-
-    bool wrote = false;
-    {
-        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-        if (file)
-        {
-            file.write(glsl.data(), static_cast<std::streamsize>(glsl.size()));
-            file.flush();
-            wrote = file.good();
-            file.close();
-        }
-    }
-
-    std::error_code error;
-    if (wrote)
-    {
-        std::filesystem::rename(temporary, path, error);
-        if (error)
-        {
-            // Windows refuses to rename onto an existing file on some file systems.
-            std::error_code removeError;
-            std::filesystem::remove(path, removeError);
-            error.clear();
-            std::filesystem::rename(temporary, path, error);
-        }
-    }
-
-    if (!wrote || error)
-    {
-        std::error_code removeError;
-        std::filesystem::remove(temporary, removeError);
-        ++m_impl->storeFailures;
-        if (m_impl->storeFailures == 1 && m_impl->debug)
-        {
-            ShaderCacheDebugLog("[projectm shader cache] cannot write " + path.string() +
-                                (error ? ": " + error.message() : std::string()));
-        }
-        return;
-    }
-
-    m_impl->storeMilliseconds += NowMilliseconds() - start;
-    ++m_impl->stores;
-    m_impl->PruneIfNeeded();
+    m_impl->EnqueueLocked(std::move(job));
 }
 
 void ShaderTranspileCache::Discard(const std::string& key)
@@ -683,9 +1152,86 @@ void ShaderTranspileCache::Discard(const std::string& key)
         return;
     }
 
+    Impl::Job job;
+    job.kind = Impl::Job::Kind::Discard;
+    job.name = key + ".glsl";
+
     std::lock_guard<std::mutex> lock(m_impl->mutex);
-    std::error_code error;
-    std::filesystem::remove(m_impl->EnabledEntryPath(key), error);
+    m_impl->EnqueueLocked(std::move(job));
+}
+
+auto ShaderTranspileCache::LookupRejected(const std::string& key, const std::string& driver, std::string& reason) -> bool
+{
+    reason.clear();
+    if (!m_impl->enabled)
+    {
+        return false;
+    }
+
+    const std::string name = Impl::RejectName(key, driver);
+    std::string contents;
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (auto pending = m_impl->PendingLocked(name))
+        {
+            contents = *pending;
+        }
+    }
+
+    if (contents.empty())
+    {
+        bool damaged = false;
+        if (!ReadSmallFile(m_impl->EntryPath(name), MaxRejectBytes, contents, damaged))
+        {
+            return false;
+        }
+    }
+
+    // "<magic>\n<driver>\n<reason>": the driver line must match exactly, so a
+    // different driver can never read another one's verdict.
+    const std::string header = std::string(RejectMagic) + "\n" + driver + "\n";
+    if (contents.compare(0, header.size(), header) != 0)
+    {
+        return false;
+    }
+    reason = FirstLine(contents.substr(header.size()));
+
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+    ++m_impl->rejectHits;
+    m_impl->RequestTouchLocked(name);
+    return true;
+}
+
+void ShaderTranspileCache::StoreRejected(const std::string& key, const std::string& driver, const std::string& reason)
+{
+    if (!m_impl->enabled)
+    {
+        return;
+    }
+
+    Impl::Job job;
+    job.kind = Impl::Job::Kind::Store;
+    job.name = Impl::RejectName(key, driver);
+    job.payload = std::make_shared<const std::string>(std::string(RejectMagic) + "\n" + driver + "\n" + FirstLine(reason) + "\n");
+
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+    ++m_impl->rejectsStored;
+    m_impl->EnqueueLocked(std::move(job));
+}
+
+void ShaderTranspileCache::DiscardRejected(const std::string& key, const std::string& driver)
+{
+    if (!m_impl->enabled)
+    {
+        return;
+    }
+
+    Impl::Job job;
+    job.kind = Impl::Job::Kind::Discard;
+    job.name = Impl::RejectName(key, driver);
+
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+    m_impl->EnqueueLocked(std::move(job));
 }
 
 void ShaderTranspileCache::RecordVerification(bool matched, const std::string& key)
@@ -699,6 +1245,19 @@ void ShaderTranspileCache::RecordVerification(bool matched, const std::string& k
     ++m_impl->verifyMismatches;
     ShaderCacheDebugLog("[projectm shader cache] VERIFY MISMATCH: the cached GLSL for key " + key +
                         " differs from a fresh transpile; the cache key is missing an input");
+}
+
+void ShaderTranspileCache::RecordRejectVerification(bool stillFails, const std::string& key)
+{
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (stillFails)
+    {
+        return;
+    }
+
+    ++m_impl->rejectVerifyMismatches;
+    ShaderCacheDebugLog("[projectm shader cache] VERIFY MISMATCH: key " + key +
+                        " is recorded as rejected on this driver but compiled; the reject entry was removed");
 }
 
 void ShaderTranspileCache::RecordCompileFailure(const std::string& key)
@@ -717,6 +1276,20 @@ void ShaderTranspileCache::RecordTranspileTime(double milliseconds)
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
     m_impl->transpileMilliseconds += milliseconds;
+}
+
+auto ShaderTranspileCache::Flush(int timeoutMilliseconds) -> bool
+{
+    std::unique_lock<std::mutex> lock(m_impl->mutex);
+    if (!m_impl->enabled)
+    {
+        return true;
+    }
+    const auto done = [this] {
+        return m_impl->queue.empty() && !m_impl->workerBusy && (m_impl->startupScanDone || !m_impl->workerRunning);
+    };
+    m_impl->idle.wait_for(lock, std::chrono::milliseconds(timeoutMilliseconds), done);
+    return done();
 }
 
 void ShaderCacheDebugLog(const std::string& line)
