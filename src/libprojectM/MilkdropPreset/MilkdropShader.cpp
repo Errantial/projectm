@@ -819,7 +819,8 @@ void MilkdropShader::TranspileHLSLShader(const PresetState& presetState, std::st
     // A shader this driver refused before fails the same way again: skip straight to
     // the caller's fallback, exactly as the failed compile below would, without
     // paying for the transpile and the failed compile. The entry is keyed on the
-    // driver's strings, so a driver update tries the shader again.
+    // driver's strings, so a driver update tries the shader again, and it expires a
+    // week after it was written, so an unchanged driver tries it again too.
     std::string driver;
     bool verifyingReject = false;
     if (!cacheKey.empty())

@@ -11,10 +11,13 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 
 #if defined(_WIN32)
@@ -26,6 +29,11 @@
 using libprojectM::MilkdropPreset::ShaderTranspileCache;
 
 namespace {
+
+/// A reject entry another process wrote at HitWritten, 2 hours before the test starts.
+constexpr const char* HitKey = "often-hit-shader";
+constexpr const char* HitDriver = "Vendor | Hits | 3.3.0 Driver 1.0 | 3.30";
+constexpr std::int64_t HitWritten = 1800000000;
 
 constexpr int OldEntries = 100;
 constexpr std::size_t EntryBytes = 8 * 1024;
@@ -104,6 +112,13 @@ struct Setup
             std::filesystem::last_write_time(path, now - std::chrono::minutes(300 - index), error);
         }
 
+        // A reject entry as another process wrote it, so this process has never
+        // touched it and the worker's recency throttle does not apply.
+        const auto rejectPath = TestDirectory() / ShaderTranspileCache::RejectEntryName(HitKey, HitDriver);
+        WriteFile(rejectPath, std::string("projectm-shader-reject 2\n") + HitDriver + "\nwritten " + std::to_string(HitWritten) +
+                                  "\ntranspile: error\n");
+        std::filesystem::last_write_time(rejectPath, now - std::chrono::hours(2), error);
+
         // A temporary file left by a process that died mid-write.
         const auto stale = TestDirectory() / "dead.glsl.tmp.1";
         WriteFile(stale, "partial");
@@ -120,6 +135,50 @@ struct Setup
 auto& Cache()
 {
     return ShaderTranspileCache::Instance();
+}
+
+/// The fake wall clock the reject tests date and age entries with.
+std::atomic<std::int64_t> fakeNow{1700000000};
+
+auto FakeClock() -> std::int64_t
+{
+    return fakeNow.load();
+}
+
+constexpr std::int64_t Day = 24 * 60 * 60;
+
+/// Installs the fake clock for one test and restores the system clock after it.
+struct FakeClockScope
+{
+    explicit FakeClockScope(std::int64_t start)
+    {
+        fakeNow = start;
+        Cache().SetWallClockForTesting(&FakeClock);
+    }
+
+    ~FakeClockScope()
+    {
+        Cache().SetWallClockForTesting(nullptr);
+    }
+};
+
+/// The reject entry file whose driver line is `driver`, or an empty path.
+auto RejectFileFor(const std::string& driver) -> std::filesystem::path
+{
+    for (const auto& item : std::filesystem::directory_iterator(TestDirectory()))
+    {
+        if (item.path().extension() != ".reject")
+        {
+            continue;
+        }
+        std::ifstream file(item.path(), std::ios::binary);
+        const std::string contents((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        if (contents.find("\n" + driver + "\n") != std::string::npos)
+        {
+            return item.path();
+        }
+    }
+    return {};
 }
 
 } // namespace
@@ -233,4 +292,109 @@ TEST(ShaderTranspileCache, TheKeyCoversEveryInput)
     EXPECT_NE(base, Cache().Key("warp", 330, 1, "", "void PS() {}"));
     EXPECT_NE(base, Cache().Key("warp", 330, 1, "uniform sampler2D sampler_main;", "void PS() { }"));
     EXPECT_EQ(base.size(), 64u);
+}
+
+TEST(ShaderTranspileCache, ARejectEntryExpiresAWeekAfterItWasWritten)
+{
+    const FakeClockScope clock(1700000000);
+    const std::string key = "expiring-shader";
+    const std::string driver = "Vendor | Expiry | 3.3.0 Driver 1.0 | 3.30";
+    std::string reason;
+
+    Cache().StoreRejected(key, driver, "driver: error");
+    ASSERT_TRUE(Cache().Flush(5000));
+
+    fakeNow += ShaderTranspileCache::RejectLifetimeSeconds - 1;
+    EXPECT_TRUE(Cache().LookupRejected(key, driver, reason)) << "expired a second early";
+    EXPECT_EQ(reason, "driver: error");
+
+    fakeNow += 1;
+    EXPECT_FALSE(Cache().LookupRejected(key, driver, reason)) << "a week-old reject entry was still trusted";
+    ASSERT_TRUE(Cache().Flush(5000));
+    EXPECT_TRUE(RejectFileFor(driver).empty()) << "the expired entry was not removed";
+
+    // The retry failed again: a new entry, dated now, lives another week.
+    Cache().StoreRejected(key, driver, "driver: error again");
+    ASSERT_TRUE(Cache().Flush(5000));
+    fakeNow += 6 * Day;
+    EXPECT_TRUE(Cache().LookupRejected(key, driver, reason));
+    EXPECT_EQ(reason, "driver: error again");
+    fakeNow += Day;
+    EXPECT_FALSE(Cache().LookupRejected(key, driver, reason));
+    ASSERT_TRUE(Cache().Flush(5000));
+}
+
+TEST(ShaderTranspileCache, AHitDoesNotExtendARejectEntry)
+{
+    const FakeClockScope clock(HitWritten);
+    const std::string driver = HitDriver;
+    std::string reason;
+    ASSERT_TRUE(Cache().Flush(5000));
+    const auto path = TestDirectory() / ShaderTranspileCache::RejectEntryName(HitKey, driver);
+    const auto before = std::filesystem::last_write_time(path);
+
+    // Hit it every day for six days, as often as the app loads the preset.
+    for (int day = 0; day < 7; ++day)
+    {
+        fakeNow = HitWritten + day * Day;
+        EXPECT_TRUE(Cache().LookupRejected(HitKey, driver, reason)) << "day " << day;
+        EXPECT_EQ(reason, "transpile: error");
+    }
+    ASSERT_TRUE(Cache().Flush(5000));
+    EXPECT_EQ(std::filesystem::last_write_time(path), before) << "a hit refreshed the entry's recency";
+
+    // Exactly 7 days after the write: the hits did not move that.
+    fakeNow = HitWritten + 7 * Day - 1;
+    EXPECT_TRUE(Cache().LookupRejected(HitKey, driver, reason));
+    fakeNow = HitWritten + 7 * Day;
+    EXPECT_FALSE(Cache().LookupRejected(HitKey, driver, reason)) << "the hits extended the entry's life";
+    ASSERT_TRUE(Cache().Flush(5000));
+    EXPECT_FALSE(std::filesystem::exists(path));
+}
+
+TEST(ShaderTranspileCache, ARejectEntryFromTheFutureIsNotTrusted)
+{
+    const FakeClockScope clock(1900000000);
+    const std::string key = "future-shader";
+    const std::string driver = "Vendor | Future | 3.3.0 Driver 1.0 | 3.30";
+    std::string reason;
+
+    Cache().StoreRejected(key, driver, "driver: error");
+    ASSERT_TRUE(Cache().Flush(5000));
+
+    // A clock a little behind another process's is fine.
+    fakeNow -= ShaderTranspileCache::RejectFutureToleranceSeconds;
+    EXPECT_TRUE(Cache().LookupRejected(key, driver, reason));
+
+    // A clock set back by a year must not keep the entry for a year and a week.
+    fakeNow -= 365 * Day;
+    EXPECT_FALSE(Cache().LookupRejected(key, driver, reason));
+    ASSERT_TRUE(Cache().Flush(5000));
+    EXPECT_TRUE(RejectFileFor(driver).empty());
+}
+
+TEST(ShaderTranspileCache, AnUndatedRejectEntryIsTriedAgain)
+{
+    const FakeClockScope clock(2000000000);
+    const std::string key = "undated-shader";
+    const std::string driver = "Vendor | Undated | 3.3.0 Driver 1.0 | 3.30";
+    std::string reason;
+
+    Cache().StoreRejected(key, driver, "driver: error");
+    ASSERT_TRUE(Cache().Flush(5000));
+    const auto path = RejectFileFor(driver);
+    ASSERT_FALSE(path.empty());
+
+    // What a build before reject entries were dated wrote under the same name.
+    WriteFile(path, "projectm-shader-reject 1\n" + driver + "\ndriver: error\n");
+    EXPECT_FALSE(Cache().LookupRejected(key, driver, reason));
+    ASSERT_TRUE(Cache().Flush(5000));
+    EXPECT_FALSE(std::filesystem::exists(path));
+
+    // A dated entry with a garbled date is no better.
+    Cache().StoreRejected(key, driver, "driver: error");
+    ASSERT_TRUE(Cache().Flush(5000));
+    WriteFile(path, "projectm-shader-reject 2\n" + driver + "\nwritten soon\ndriver: error\n");
+    EXPECT_FALSE(Cache().LookupRejected(key, driver, reason));
+    ASSERT_TRUE(Cache().Flush(5000));
 }
