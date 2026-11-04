@@ -3,6 +3,7 @@
 #include "Renderer/TextureSamplerDescriptor.hpp"
 #include "Renderer/TextureTypes.hpp"
 
+#include <future>
 #include <map>
 #include <string>
 #include <vector>
@@ -97,12 +98,18 @@ private:
 
     void ScanTextures();
 
+    /**
+     * @brief Starts a rescan of the search paths on a background thread, for the next preset load.
+     */
+    void StartBackgroundScan();
+
     static uint32_t TextureFormatFromChannels(int channels);
 
     std::vector<std::string> m_textureSearchPaths;  //!< Search paths to scan for textures.
     std::string m_currentPresetDir;                 //!< Path of the current preset to add to the search list.
     std::vector<ScannedFile> m_scannedTextureFiles; //!< The cached list with scanned texture files.
-    bool m_filesScanned{false};                     //!< true if files were scanned since last preset load.
+    bool m_filesScanned{false};                     //!< true if the list above is usable.
+    std::future<std::vector<ScannedFile>> m_nextScan; //!< A rescan running in the background, used by the next preset load.
 
     std::shared_ptr<Texture> m_placeholderTexture;                          //!< Texture used if a requested file couldn't be found. A black 1x1 texture.
     std::map<std::string, std::shared_ptr<Texture>> m_textures;             //!< All loaded textures, including generated ones.

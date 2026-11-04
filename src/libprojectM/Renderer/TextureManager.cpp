@@ -11,6 +11,7 @@
 #include <stb_image.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <memory>
 #include <random>
@@ -113,9 +114,23 @@ void TextureManager::PurgeTextures()
         }
     }
 
-    // Clear file cache
-    m_scannedTextureFiles.clear();
-    m_filesScanned = false;
+    // Refresh the file list. Scanning walks every search path recursively, which on
+    // a folder of ten thousand presets is 10 to 20 ms, and used to happen on the
+    // render thread for every preset that asked for a texture not loaded yet. Now
+    // only the first load scans here; every later load takes the list a background
+    // scan made since the previous load (so a texture file added since then is
+    // still found) and starts the next one. If that scan is not done yet, the
+    // previous list is used.
+    if (m_nextScan.valid() &&
+        m_nextScan.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+    {
+        m_scannedTextureFiles = m_nextScan.get();
+        m_filesScanned = true;
+    }
+    if (m_filesScanned && !m_nextScan.valid())
+    {
+        StartBackgroundScan();
+    }
 
     // Only purge textures with an age of 2 or higher, so we don't evict textures used by the preset being blended out
     uint32_t newest = 99999999;
@@ -404,11 +419,36 @@ void TextureManager::ScanTextures()
 {
     if (!m_filesScanned)
     {
+        m_scannedTextureFiles.clear();
         FileScanner fileScanner = FileScanner(m_textureSearchPaths, m_extensions);
 
         using namespace std::placeholders;
         fileScanner.Scan(std::bind(&TextureManager::AddTextureFile, this, _1, _2));
         m_filesScanned = true;
+    }
+}
+
+void TextureManager::StartBackgroundScan()
+{
+    // The scan only reads the copies it is given, so it shares nothing with this thread.
+    try
+    {
+        m_nextScan = std::async(std::launch::async, [paths = m_textureSearchPaths, extensions = m_extensions]() mutable {
+            std::vector<ScannedFile> files;
+            FileScanner fileScanner(paths, extensions);
+            fileScanner.Scan([&files](const std::string& fileName, const std::string& baseName) {
+                ScannedFile file;
+                file.filePath = fileName;
+                file.lowerCaseBaseName = Utils::ToLower(baseName);
+                files.push_back(std::move(file));
+            });
+            return files;
+        });
+    }
+    catch (...)
+    {
+        // No thread: scan on the next request, as before.
+        m_filesScanned = false;
     }
 }
 
