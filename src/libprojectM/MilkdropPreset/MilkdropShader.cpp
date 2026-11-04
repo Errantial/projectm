@@ -778,7 +778,7 @@ void MilkdropShader::TranspileHLSLShader(const PresetState& presetState, std::st
                 if (cache.DebugEnabled())
                 {
                     ShaderCacheDebugLog("[projectm shader cache] hit " + cacheKey.substr(0, 16) + " " +
-                                        shaderTypeString + " read+compile=" + FormatMilliseconds(compileMilliseconds));
+                                        shaderTypeString + " compile=" + FormatMilliseconds(compileMilliseconds));
                 }
                 return;
             }

@@ -295,6 +295,7 @@ struct ShaderTranspileCache::Impl
         if (!disableValue.empty() && !EnvTruthy("PROJECTM_SHADER_CACHE"))
         {
             disabledReason = "PROJECTM_SHADER_CACHE is set to a false value";
+            LogDisabled();
             return;
         }
 
@@ -327,6 +328,7 @@ struct ShaderTranspileCache::Impl
             if (cacheDirectory.empty())
             {
                 disabledReason = "no platform cache directory in the environment";
+                LogDisabled();
                 return;
             }
         }
@@ -336,6 +338,7 @@ struct ShaderTranspileCache::Impl
         if (error)
         {
             disabledReason = "cannot create " + cacheDirectory.string() + ": " + error.message();
+            LogDisabled();
             return;
         }
 
@@ -352,6 +355,14 @@ struct ShaderTranspileCache::Impl
     ~Impl()
     {
         PrintSummary();
+    }
+
+    void LogDisabled() const
+    {
+        if (debug)
+        {
+            ShaderCacheDebugLog("[projectm shader cache] disabled: " + disabledReason);
+        }
     }
 
     auto EnabledEntryPath(const std::string& key) const -> std::filesystem::path
