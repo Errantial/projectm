@@ -138,6 +138,28 @@ auto TranspileSource(const std::string& shaderTypeString,
     return std::string(generator.GetResult());
 }
 
+/**
+ * @brief The GL driver's identity, for reject entries: what one driver refuses,
+ *        another (or the same after an update) may accept.
+ */
+auto DriverIdentity() -> std::string
+{
+    std::string identity;
+    for (const GLenum name : {GL_VENDOR, GL_RENDERER, GL_VERSION, GL_SHADING_LANGUAGE_VERSION})
+    {
+        const auto* value = reinterpret_cast<const char*>(glGetString(name));
+        if (!identity.empty())
+        {
+            identity.append(" | ");
+        }
+        identity.append(value != nullptr ? value : "?");
+    }
+    // One line, so the entry's header format stays line-based.
+    std::replace(identity.begin(), identity.end(), '\n', ' ');
+    std::replace(identity.begin(), identity.end(), '\r', ' ');
+    return identity;
+}
+
 } // namespace
 
 MilkdropShader::MilkdropShader(ShaderType type)
@@ -794,17 +816,90 @@ void MilkdropShader::TranspileHLSLShader(const PresetState& presetState, std::st
         }
     }
 
+    // A shader this driver refused before fails the same way again: skip straight to
+    // the caller's fallback, exactly as the failed compile below would, without
+    // paying for the transpile and the failed compile. The entry is keyed on the
+    // driver's strings, so a driver update tries the shader again.
+    std::string driver;
+    bool verifyingReject = false;
+    if (!cacheKey.empty())
+    {
+        driver = DriverIdentity();
+        std::string reason;
+        if (cache.LookupRejected(cacheKey, driver, reason))
+        {
+            if (!cache.VerifyEnabled())
+            {
+                if (cache.DebugEnabled())
+                {
+                    ShaderCacheDebugLog("[projectm shader cache] reject-hit " + cacheKey.substr(0, 16) + " " +
+                                        shaderTypeString + " " + reason);
+                }
+                LOG_ERROR("[MilkdropShader] Skipping " + shaderTypeString + " shader this driver rejected before: " + reason);
+                throw Renderer::ShaderException("[MilkdropShader] " + shaderTypeString + " shader rejected before on this driver: " + reason);
+            }
+            // Verify mode: do the whole work again and check it still fails.
+            verifyingReject = true;
+        }
+    }
+
+    // Remembers a failure for the next load, or confirms a reject entry in verify mode.
+    auto const rejected = [&](const std::string& stage, const std::string& message) {
+        if (cacheKey.empty())
+        {
+            return;
+        }
+        if (verifyingReject)
+        {
+            cache.RecordRejectVerification(true, cacheKey);
+            return;
+        }
+        cache.StoreRejected(cacheKey, driver, stage + ": " + message);
+    };
+
     TranspilePhases phases;
     double const transpileStart = NowMilliseconds();
-    std::string const glsl = TranspileSource(shaderTypeString, declarations, program, phases);
+    std::string glsl;
+    try
+    {
+        glsl = TranspileSource(shaderTypeString, declarations, program, phases);
+    }
+    catch (const Renderer::ShaderException& exception)
+    {
+        cache.RecordTranspileTime(NowMilliseconds() - transpileStart);
+        rejected("transpile", exception.message());
+        throw;
+    }
     double const transpileMilliseconds = NowMilliseconds() - transpileStart;
     cache.RecordTranspileTime(transpileMilliseconds);
 
     // Now we have GLSL source for the preset shader program (hopefully it's valid!)
     // Compile the preset shader fragment shader with the standard vertex shader and cross our fingers.
     double const compileStart = NowMilliseconds();
-    m_shader.CompileProgram(vertexShaderSource, glsl);
+    try
+    {
+        m_shader.CompileProgram(vertexShaderSource, glsl);
+    }
+    catch (const Renderer::ShaderException& exception)
+    {
+        if (cache.DebugEnabled())
+        {
+            ShaderCacheDebugLog("[projectm shader cache] rejected " + (cacheKey.empty() ? std::string("(disabled)") : cacheKey.substr(0, 16)) +
+                                " " + shaderTypeString +
+                                " transpile=" + FormatMilliseconds(transpileMilliseconds) +
+                                " driver=" + FormatMilliseconds(NowMilliseconds() - compileStart));
+        }
+        rejected("driver", exception.message());
+        throw;
+    }
     double const compileMilliseconds = NowMilliseconds() - compileStart;
+
+    if (verifyingReject)
+    {
+        // Recorded as rejected, but it compiled: the entry is wrong, drop it.
+        cache.RecordRejectVerification(false, cacheKey);
+        cache.DiscardRejected(cacheKey, driver);
+    }
 
     // Only a successful transpile and compile is worth keeping.
     if (!cacheKey.empty())
