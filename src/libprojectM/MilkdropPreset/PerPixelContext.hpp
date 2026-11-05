@@ -20,12 +20,30 @@ public:
     /**
      * @brief Destructor.
      */
+    /**
+     * @brief Takes over a context, and the code compiled in it, that a PreparedPreset built on another thread.
+     * Variable values are kept as they are; only the pointers to them are looked up again.
+     * @param adoptedContext The context. This object destroys it.
+     * @param adoptedCode The compiled code, or nullptr if there is none.
+     */
+    PerPixelContext(projectm_eval_context* adoptedContext, projectm_eval_code* adoptedCode);
+
     ~PerPixelContext();
+
+    /**
+     * @brief Hands the context and the compiled code to the caller, who then owns them.
+     */
+    void Release(projectm_eval_context*& context, projectm_eval_code*& code);
 
     /**
      * @brief Registers the state variables in the expression evaluator context.
      */
     void RegisterBuiltinVariables();
+
+    /**
+     * @brief Looks up the pointers to the built-in variables without changing their values.
+     */
+    void RegisterVariablePointers();
 
     /**
      * @brief Loads the current state read-only values into the expression evaluator variables.

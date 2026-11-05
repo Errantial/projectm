@@ -22,12 +22,30 @@ public:
      */
     ShapePerFrameContext(projectm_eval_mem_buffer gmegabuf, PRJM_EVAL_F (*globalRegisters)[100]);
 
+    /**
+     * @brief Takes over a context, and the code compiled in it, that a PreparedPreset built on another thread.
+     * Variable values are kept as they are; only the pointers to them are looked up again.
+     * @param adoptedContext The context. This object destroys it.
+     * @param adoptedCode The compiled code, or nullptr if there is none.
+     */
+    ShapePerFrameContext(projectm_eval_context* adoptedContext, projectm_eval_code* adoptedCode);
+
     ~ShapePerFrameContext();
+
+    /**
+     * @brief Hands the context and the compiled code to the caller, who then owns them.
+     */
+    void Release(projectm_eval_context*& context, projectm_eval_code*& code);
 
     /**
      * @brief Registers the state variables in the expression evaluator context.
      */
     void RegisterBuiltinVariables();
+
+    /**
+     * @brief Looks up the pointers to the built-in variables without changing their values.
+     */
+    void RegisterVariablePointers();
 
     /**
      * @brief Loads the current state values into the expression evaluator variables.
@@ -53,7 +71,7 @@ public:
      * @param perFrameCode The code to compile.
      * @param shape The shape this context belongs to.
      */
-    void CompilePerFrameCode(const std::string& perFrameCode, const CustomShape& shape);
+    void CompilePerFrameCode(const std::string& perFrameCode, int shapeIndex);
 
     /**
      * @brief Executes the per-frame code with the current state.

@@ -5,6 +5,7 @@
 #include <Renderer/BlendMode.hpp>
 #include <Renderer/TextureManager.hpp>
 
+#include <array>
 #include <vector>
 
 namespace libprojectM {
@@ -23,6 +24,20 @@ CustomShape::CustomShape(PresetState& presetState)
     m_fillMesh.SetRenderPrimitiveType(Renderer::Mesh::PrimitiveType::TriangleFan);
 
     m_perFrameContext.RegisterBuiltinVariables();
+}
+
+CustomShape::CustomShape(PresetState& presetState, PreparedPreset::Code& perFrame)
+    : m_outlineMesh(Renderer::VertexBufferUsage::StreamDraw)
+    , m_fillMesh(Renderer::VertexBufferUsage::StreamDraw, true, false)
+    , m_presetState(presetState)
+    , m_perFrameContext(perFrame.TakeContext(), perFrame.TakeCode())
+    , m_codePrepared(true)
+{
+    m_outlineMesh.SetVertexCount(100);
+    m_outlineMesh.SetRenderPrimitiveType(Renderer::Mesh::PrimitiveType::LineLoop);
+
+    m_fillMesh.SetVertexCount(102);
+    m_fillMesh.SetRenderPrimitiveType(Renderer::Mesh::PrimitiveType::TriangleFan);
 }
 
 void CustomShape::Initialize(PresetFileParser& parsedFile, int index)
@@ -69,7 +84,10 @@ void CustomShape::CompileCodeAndRunInitExpressions()
         m_tValuesAfterInitCode[t] = *m_perFrameContext.t_vars[t];
     }
 
-    m_perFrameContext.CompilePerFrameCode(m_presetState.customShapePerFrameCode[m_index], *this);
+    if (!m_codePrepared)
+    {
+        m_perFrameContext.CompilePerFrameCode(m_presetState.customShapePerFrameCode[m_index], m_index);
+    }
 }
 
 void CustomShape::Draw()
@@ -81,7 +99,24 @@ void CustomShape::Draw()
         return;
     }
 
-    Renderer::BlendMode::SetBlendActive(true);
+    // Every instance's per-frame code runs first, then all of their geometry goes to the GPU in
+    // one upload per buffer, and the instances are drawn from it in the same order, with the same
+    // state, as one upload and draw per instance did before. Uploading once per instance made the
+    // driver copy or wait on a buffer the previous draw still used, which cost far more than the
+    // shapes' expressions in presets with hundreds of instances.
+    auto& fillVertices = m_fillMesh.Vertices().Get();
+    auto& fillColors = m_fillMesh.Colors().Get();
+    auto& fillUVs = m_fillMesh.UVs().Get();
+    auto& outlineVertices = m_outlineMesh.Vertices().Get();
+    m_instanceDraws.clear();
+    fillVertices.clear();
+    fillColors.clear();
+    fillUVs.clear();
+    outlineVertices.clear();
+
+    bool anyTextured{false};
+    bool imageLookedUp{false};
+    Renderer::TextureSamplerDescriptor imageDesc;
 
     for (int instance = 0; instance < m_instances; instance++)
     {
@@ -98,14 +133,17 @@ void CustomShape::Draw()
             sides = 100;
         }
 
-        // Additive Drawing or Overwrite
-        Renderer::BlendMode::SetBlendFunction(Renderer::BlendMode::Function::SourceAlpha,
-                                              static_cast<int>(*m_perFrameContext.additive) != 0
-                                                  ? Renderer::BlendMode::Function::One
-                                                  : Renderer::BlendMode::Function::OneMinusSourceAlpha);
+        InstanceDraw draw;
+        draw.sides = sides;
+        draw.additive = static_cast<int>(*m_perFrameContext.additive) != 0;
+        draw.textured = static_cast<int>(*m_perFrameContext.textured) != 0;
+        draw.fillFirst = static_cast<GLint>(fillVertices.size());
 
-        auto& vertexData = m_fillMesh.Vertices();
-        auto& colorData = m_fillMesh.Colors();
+        const size_t first = fillVertices.size();
+        fillVertices.resize(first + sides + 2);
+        fillColors.resize(first + sides + 2);
+        auto* vertexData = &fillVertices[first];
+        auto* colorData = &fillColors[first];
 
         vertexData[0] = Renderer::Point(static_cast<float>(*m_perFrameContext.x * 2.0 - 1.0),
                                         static_cast<float>(*m_perFrameContext.y * -2.0 + 1.0));
@@ -142,42 +180,28 @@ void CustomShape::Draw()
         vertexData[sides + 1] = vertexData[1];
         colorData[sides + 1] = colorData[1];
 
-        m_fillMesh.SetUseUV(static_cast<int>(*m_perFrameContext.textured) != 0);
-
-        if (m_fillMesh.UseUV())
+        if (draw.textured)
         {
-            auto shader = m_presetState.texturedShader.lock();
-            shader->Bind();
-            shader->SetUniformMat4x4("vertex_transformation", PresetState::orthogonalProjection);
-            shader->SetUniformInt("texture_sampler", 0);
+            anyTextured = true;
 
             // Textured shape, either main texture or texture from "image" key
             auto textureAspectY = m_presetState.renderContext.aspectY;
-            if (m_image.empty())
+            if (!m_image.empty())
             {
-                assert(!m_presetState.mainTexture.expired());
-                m_presetState.mainTexture.lock()->Bind(0);
-            }
-            else
-            {
-                auto desc = m_presetState.renderContext.textureManager->GetTexture(m_image);
-                if (!desc.Empty())
+                if (!imageLookedUp)
                 {
-                    desc.Bind(0, *shader);
+                    imageDesc = m_presetState.renderContext.textureManager->GetTexture(m_image);
+                    imageLookedUp = true;
+                }
+                if (!imageDesc.Empty())
+                {
                     textureAspectY = 1.0f;
-                }
-                else
-                {
-                    // No texture found, fall back to main texture.
-                    assert(!m_presetState.mainTexture.expired());
-                    m_presetState.mainTexture.lock()->Bind(0);
+                    draw.useImage = true;
                 }
             }
 
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-
-            auto& uvs = m_fillMesh.UVs();
+            fillUVs.resize(fillVertices.size());
+            auto* uvs = &fillUVs[first];
 
             uvs[0] = Renderer::TextureUV(0.5f, 0.5f);
 
@@ -192,58 +216,29 @@ void CustomShape::Draw()
 
             uvs[sides + 1] = uvs[1];
         }
-        else
-        {
-            // Untextured (creates a color gradient: center=r/g/b/a to border=r2/b2/g2/a2)
-            auto shader = m_presetState.untexturedShader.lock();
-            shader->Bind();
-            shader->SetUniformMat4x4("vertex_transformation", PresetState::orthogonalProjection);
-        }
-
-        m_fillMesh.Indices().Resize(sides + 2);
-        m_fillMesh.Indices().MakeContinuous();
-        m_fillMesh.Update();
-        m_fillMesh.Draw();
-
-        glBindTexture(GL_TEXTURE_2D, 0);
-        Renderer::Sampler::Unbind(0);
 
         if (*m_perFrameContext.border_a > 0.0001f)
         {
-            m_outlineMesh.Indices().Resize(sides);
-            m_outlineMesh.Indices().MakeContinuous();
-
-            auto& points = m_outlineMesh.Vertices();
-
-            for (int i = 0; i < sides; i++)
-            {
-                points[i] = m_fillMesh.Vertex(i + 1);
-            }
-
-            auto shader = m_presetState.untexturedShader.lock();
-            shader->Bind();
-            shader->SetUniformMat4x4("vertex_transformation", PresetState::orthogonalProjection);
-            shader->SetUniformFloat("vertex_point_size", 1.0f);
-
-            glVertexAttrib4f(1,
-                             static_cast<float>(*m_perFrameContext.border_r),
-                             static_cast<float>(*m_perFrameContext.border_g),
-                             static_cast<float>(*m_perFrameContext.border_b),
-                             static_cast<float>(*m_perFrameContext.border_a));
-            glLineWidth(1);
-#ifndef USE_GLES
-            glEnable(GL_LINE_SMOOTH);
-#endif
-
-            const auto iterations = m_thickOutline ? 4 : 1;
+            draw.border = true;
+            draw.borderColor[0] = static_cast<float>(*m_perFrameContext.border_r);
+            draw.borderColor[1] = static_cast<float>(*m_perFrameContext.border_g);
+            draw.borderColor[2] = static_cast<float>(*m_perFrameContext.border_b);
+            draw.borderColor[3] = static_cast<float>(*m_perFrameContext.border_a);
+            draw.outlineFirst = static_cast<GLint>(outlineVertices.size());
+            draw.iterations = m_thickOutline ? 4 : 1;
 
             // Need to use +/- 1.0 here instead of 2.0 used in Milkdrop to achieve the same rendering result.
             const auto incrementX = 1.0f / static_cast<float>(m_presetState.renderContext.viewportSizeX);
             const auto incrementY = 1.0f / static_cast<float>(m_presetState.renderContext.viewportSizeY);
 
             // If thick outline is used, draw the shape four times with slight offsets
-            // (top left, top right, bottom right, bottom left).
-            for (auto iteration = 0; iteration < iterations; iteration++)
+            // (top left, top right, bottom right, bottom left), each pass moving the previous one.
+            std::array<Renderer::Point, 100> points;
+            for (int i = 0; i < sides; i++)
+            {
+                points[i] = fillVertices[first + i + 1];
+            }
+            for (auto iteration = 0; iteration < draw.iterations; iteration++)
             {
                 switch (iteration)
                 {
@@ -271,10 +266,121 @@ void CustomShape::Draw()
                         }
                         break;
                 }
-
-                m_outlineMesh.Update();
-                m_outlineMesh.Draw();
+                outlineVertices.insert(outlineVertices.end(), points.begin(), points.begin() + sides);
             }
+        }
+
+        m_instanceDraws.push_back(draw);
+    }
+
+    if (m_instanceDraws.empty())
+    {
+        return;
+    }
+
+    Renderer::BlendMode::SetBlendActive(true);
+
+    // One upload per buffer for all instances.
+    m_fillMesh.Bind();
+    m_fillMesh.Vertices().Update();
+    m_fillMesh.Colors().Update();
+    if (anyTextured)
+    {
+        m_fillMesh.UVs().Update();
+    }
+    if (!outlineVertices.empty())
+    {
+        m_outlineMesh.Bind();
+        m_outlineMesh.Vertices().Update();
+        Renderer::VertexBuffer<Renderer::Color>::SetEnableAttributeArray(1, false);
+        Renderer::VertexBuffer<Renderer::TextureUV>::SetEnableAttributeArray(2, false);
+    }
+
+    // The two shaders keep their uniforms between binds, and nothing else sets them while the
+    // shape draws, so each is set once on first use instead of once per instance.
+    bool texturedUniformsSet{false};
+    bool untexturedUniformsSet{false};
+    bool outlineUniformsSet{false};
+
+    for (const auto& draw : m_instanceDraws)
+    {
+        // Additive Drawing or Overwrite
+        Renderer::BlendMode::SetBlendFunction(Renderer::BlendMode::Function::SourceAlpha,
+                                              draw.additive
+                                                  ? Renderer::BlendMode::Function::One
+                                                  : Renderer::BlendMode::Function::OneMinusSourceAlpha);
+
+        m_fillMesh.Bind();
+        Renderer::VertexBuffer<Renderer::Color>::SetEnableAttributeArray(1, true);
+        Renderer::VertexBuffer<Renderer::TextureUV>::SetEnableAttributeArray(2, draw.textured);
+
+        if (draw.textured)
+        {
+            auto shader = m_presetState.texturedShader.lock();
+            shader->Bind();
+            if (!texturedUniformsSet)
+            {
+                shader->SetUniformMat4x4("vertex_transformation", PresetState::orthogonalProjection);
+                shader->SetUniformInt("texture_sampler", 0);
+                texturedUniformsSet = true;
+            }
+
+            if (draw.useImage)
+            {
+                imageDesc.Bind(0, *shader);
+            }
+            else
+            {
+                // Main texture, also the fallback when the "image" texture was not found.
+                assert(!m_presetState.mainTexture.expired());
+                m_presetState.mainTexture.lock()->Bind(0);
+            }
+
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        }
+        else
+        {
+            // Untextured (creates a color gradient: center=r/g/b/a to border=r2/b2/g2/a2)
+            auto shader = m_presetState.untexturedShader.lock();
+            shader->Bind();
+            if (!untexturedUniformsSet)
+            {
+                shader->SetUniformMat4x4("vertex_transformation", PresetState::orthogonalProjection);
+                untexturedUniformsSet = true;
+            }
+        }
+
+        glDrawArrays(GL_TRIANGLE_FAN, draw.fillFirst, draw.sides + 2);
+        Renderer::VertexArray::Unbind();
+
+        glBindTexture(GL_TEXTURE_2D, 0);
+        Renderer::Sampler::Unbind(0);
+
+        if (draw.border)
+        {
+            auto shader = m_presetState.untexturedShader.lock();
+            shader->Bind();
+            if (!outlineUniformsSet)
+            {
+                shader->SetUniformMat4x4("vertex_transformation", PresetState::orthogonalProjection);
+                shader->SetUniformFloat("vertex_point_size", 1.0f);
+                outlineUniformsSet = true;
+                untexturedUniformsSet = true;
+            }
+
+            glVertexAttrib4f(1, draw.borderColor[0], draw.borderColor[1], draw.borderColor[2], draw.borderColor[3]);
+            glLineWidth(1);
+#ifndef USE_GLES
+            glEnable(GL_LINE_SMOOTH);
+#endif
+
+            m_outlineMesh.Bind();
+            for (auto iteration = 0; iteration < draw.iterations; iteration++)
+            {
+                glDrawArrays(GL_LINE_LOOP, draw.outlineFirst + iteration * draw.sides, draw.sides);
+            }
+            Renderer::VertexArray::Unbind();
         }
     }
 

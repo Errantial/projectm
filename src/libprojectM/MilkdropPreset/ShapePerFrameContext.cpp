@@ -16,6 +16,21 @@ ShapePerFrameContext::ShapePerFrameContext(projectm_eval_mem_buffer gmegabuf, PR
 {
 }
 
+ShapePerFrameContext::ShapePerFrameContext(projectm_eval_context* adoptedContext, projectm_eval_code* adoptedCode)
+    : perFrameCodeContext(adoptedContext)
+    , perFrameCodeHandle(adoptedCode)
+{
+    RegisterVariablePointers();
+}
+
+void ShapePerFrameContext::Release(projectm_eval_context*& context, projectm_eval_code*& code)
+{
+    context = perFrameCodeContext;
+    code = perFrameCodeHandle;
+    perFrameCodeContext = nullptr;
+    perFrameCodeHandle = nullptr;
+}
+
 ShapePerFrameContext::~ShapePerFrameContext()
 {
     if (perFrameCodeHandle != nullptr)
@@ -32,7 +47,11 @@ ShapePerFrameContext::~ShapePerFrameContext()
 void ShapePerFrameContext::RegisterBuiltinVariables()
 {
     projectm_eval_context_reset_variables(perFrameCodeContext);
+    RegisterVariablePointers();
+}
 
+void ShapePerFrameContext::RegisterVariablePointers()
+{
     REG_VAR(time);
     REG_VAR(fps);
     REG_VAR(frame);
@@ -168,7 +187,7 @@ void ShapePerFrameContext::EvaluateInitCode(const std::string& perFrameInitCode,
 }
 
 void ShapePerFrameContext::CompilePerFrameCode(const std::string& perFrameCode,
-                                               const CustomShape& shape)
+                                               int shapeIndex)
 {
     if (perFrameCode.empty())
     {
@@ -185,14 +204,14 @@ void ShapePerFrameContext::CompilePerFrameCode(const std::string& perFrameCode,
         if (errmsg)
         {
             error = "[ShapePerFrameContext] Could not compile custom shape ";
-            error += std::to_string(shape.m_index);
+            error += std::to_string(shapeIndex);
             error +=  " per-frame code: ";
             error += errmsg;
             error += "(L" + std::to_string(line) + " C" + std::to_string(col) + ")";
         }
         else
         {
-            error = "[ShapePerFrameContext] Could not compile custom shape " + std::to_string(shape.m_index) + " per-frame code.";
+            error = "[ShapePerFrameContext] Could not compile custom shape " + std::to_string(shapeIndex) + " per-frame code.";
         }
         LOG_DEBUG("[ShapePerFrameContext] Failed custom shape per-frame code:\n" + perFrameCode);
         throw MilkdropCompileException(error);

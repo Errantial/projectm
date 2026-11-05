@@ -26,6 +26,8 @@
 #include "PresetFactoryManager.hpp"
 #include "TimeKeeper.hpp"
 
+#include <MilkdropPreset/Factory.hpp>
+
 #include <Audio/PCM.hpp>
 
 #include <Renderer/CopyTexture.hpp>
@@ -83,6 +85,33 @@ void ProjectM::LoadPresetData(std::istream& presetData, bool smoothTransition)
         LOG_ERROR(ex.what());
         PresetSwitchFailedEvent("", ex.what());
     }
+}
+
+auto ProjectM::LoadPreparedPresetData(const char* presetData, bool smoothTransition) -> bool
+{
+    // As LoadPresetData(), with the parse and the expression compile already done. Building the
+    // preset before the texture purge is the same: textures are first looked up in Initialize().
+    try
+    {
+        auto preset = MilkdropPreset::Factory::LoadPreparedPreset(presetData);
+        if (!preset)
+        {
+            return false;
+        }
+        m_textureManager->PurgeTextures();
+        StartPresetTransition(std::move(preset), !smoothTransition);
+    }
+    catch (const std::exception& ex)
+    {
+        LOG_ERROR(ex.what());
+        PresetSwitchFailedEvent("", ex.what());
+    }
+    return true;
+}
+
+void ProjectM::PreparePresetData(const char* presetData)
+{
+    MilkdropPreset::Factory::PreparePresetData(presetData);
 }
 
 void ProjectM::SetTexturePaths(std::vector<std::string> texturePaths)

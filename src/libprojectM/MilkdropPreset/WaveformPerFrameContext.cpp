@@ -17,6 +17,21 @@ WaveformPerFrameContext::WaveformPerFrameContext(projectm_eval_mem_buffer gmegab
 {
 }
 
+WaveformPerFrameContext::WaveformPerFrameContext(projectm_eval_context* adoptedContext, projectm_eval_code* adoptedCode)
+    : perFrameCodeContext(adoptedContext)
+    , perFrameCodeHandle(adoptedCode)
+{
+    RegisterVariablePointers();
+}
+
+void WaveformPerFrameContext::Release(projectm_eval_context*& context, projectm_eval_code*& code)
+{
+    context = perFrameCodeContext;
+    code = perFrameCodeHandle;
+    perFrameCodeContext = nullptr;
+    perFrameCodeHandle = nullptr;
+}
+
 WaveformPerFrameContext::~WaveformPerFrameContext()
 {
     if (perFrameCodeHandle != nullptr)
@@ -33,7 +48,11 @@ WaveformPerFrameContext::~WaveformPerFrameContext()
 void WaveformPerFrameContext::RegisterBuiltinVariables()
 {
     projectm_eval_context_reset_variables(perFrameCodeContext);
+    RegisterVariablePointers();
+}
 
+void WaveformPerFrameContext::RegisterVariablePointers()
+{
     REG_VAR(time);
     REG_VAR(fps);
     REG_VAR(frame);
@@ -130,7 +149,7 @@ void WaveformPerFrameContext::EvaluateInitCode(const std::string& perFrameInitCo
 }
 
 void WaveformPerFrameContext::CompilePerFrameCode(const std::string& perFrameCode,
-                                                  const CustomWaveform& waveform)
+                                                  int waveformIndex)
 {
     if (perFrameCode.empty())
     {
@@ -147,14 +166,14 @@ void WaveformPerFrameContext::CompilePerFrameCode(const std::string& perFrameCod
         if (errmsg)
         {
             error = "[WaveformPerFrameContext] Could not compile custom wave ";
-            error += waveform.m_index;
+            error += waveformIndex;
             error += " per-frame code: ";
             error += errmsg;
             error += "(L" + std::to_string(line) + " C" + std::to_string(col) + ")";
         }
         else
         {
-            error = "[WaveformPerFrameContext] Could not compile custom wave " + std::to_string(waveform.m_index) + " per-frame code.";
+            error = "[WaveformPerFrameContext] Could not compile custom wave " + std::to_string(waveformIndex) + " per-frame code.";
         }
         LOG_DEBUG("[WaveformPerFrameContext] Failed custom wave per-frame code:\n" + perFrameCode);
         throw MilkdropCompileException(error);

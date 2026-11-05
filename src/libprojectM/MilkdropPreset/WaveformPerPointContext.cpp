@@ -17,6 +17,21 @@ WaveformPerPointContext::WaveformPerPointContext(projectm_eval_mem_buffer gmegab
 {
 }
 
+WaveformPerPointContext::WaveformPerPointContext(projectm_eval_context* adoptedContext, projectm_eval_code* adoptedCode)
+    : perPointCodeContext(adoptedContext)
+    , perPointCodeHandle(adoptedCode)
+{
+    RegisterVariablePointers();
+}
+
+void WaveformPerPointContext::Release(projectm_eval_context*& context, projectm_eval_code*& code)
+{
+    context = perPointCodeContext;
+    code = perPointCodeHandle;
+    perPointCodeContext = nullptr;
+    perPointCodeHandle = nullptr;
+}
+
 WaveformPerPointContext::~WaveformPerPointContext()
 {
     if (perPointCodeHandle != nullptr)
@@ -33,7 +48,11 @@ WaveformPerPointContext::~WaveformPerPointContext()
 void WaveformPerPointContext::RegisterBuiltinVariables()
 {
     projectm_eval_context_reset_variables(perPointCodeContext);
+    RegisterVariablePointers();
+}
 
+void WaveformPerPointContext::RegisterVariablePointers()
+{
     REG_VAR(time);
     REG_VAR(fps);
     REG_VAR(frame);
@@ -83,7 +102,7 @@ void WaveformPerPointContext::LoadReadOnlyStateVariables(const PerFrameContext& 
 }
 
 void WaveformPerPointContext::CompilePerPointCode(const std::string& perPointCode,
-                                                  const CustomWaveform& waveform)
+                                                  int waveformIndex)
 {
     if (perPointCode.empty())
     {
@@ -100,16 +119,16 @@ void WaveformPerPointContext::CompilePerPointCode(const std::string& perPointCod
         if (errmsg)
         {
             error = "[WaveformPerPointContext] Could not compile custom wave ";
-            error += std::to_string(waveform.m_index);
+            error += std::to_string(waveformIndex);
             error += " per-point code: ";
             error += errmsg;
             error += "(L" + std::to_string(line) + " C" + std::to_string(col) + ")";
         }
         else
         {
-            error = "[WaveformPerPointContext] Could not compile custom wave " + std::to_string(waveform.m_index) + " per-point code.";
+            error = "[WaveformPerPointContext] Could not compile custom wave " + std::to_string(waveformIndex) + " per-point code.";
         }
-        LOG_DEBUG("[WaveformPerPointContext] Failed custom wave " + std::to_string(waveform.m_index) + " per-point code:\n" + perPointCode);
+        LOG_DEBUG("[WaveformPerPointContext] Failed custom wave " + std::to_string(waveformIndex) + " per-point code:\n" + perPointCode);
         throw MilkdropCompileException(error);
     }
 }

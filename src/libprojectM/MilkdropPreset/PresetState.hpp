@@ -17,6 +17,9 @@
 
 #include <projectm-eval.h>
 
+#include <algorithm>
+#include <iterator>
+#include <memory>
 #include <string>
 
 namespace libprojectM {
@@ -35,7 +38,22 @@ using BlendableFloat = float; //!< Currently a placeholder to mark blendable val
 class PresetState
 {
 public:
+    /**
+     * @brief reg00-reg99 of a prepared preset (see PreparedPreset), compiled against before the
+     * preset exists and so kept on the heap.
+     */
+    struct GlobalRegisters {
+        PRJM_EVAL_F values[100]{};
+    };
+
     PresetState();
+
+    /**
+     * @brief Creates the state around expression memory that was filled ahead of time.
+     * @param adoptedMemory The gmegabuf buffer. The state destroys it.
+     * @param adoptedRegisters The reg00-reg99 variables the prepared code addresses.
+     */
+    PresetState(projectm_eval_mem_buffer adoptedMemory, std::unique_ptr<GlobalRegisters> adoptedRegisters);
 
     ~PresetState();
 
@@ -163,6 +181,25 @@ public:
 
     static const glm::mat4 orthogonalProjection;        //!< Projection matrix that transforms DirectX screen-space coordinates into the OpenGL coordinate frame.
     static const glm::mat4 orthogonalProjectionFlipped; //!< Projection matrix that transforms DirectX screen-space coordinates into the OpenGL coordinate frame.
+
+    // Members added after the original ones, so every original member keeps its offset: a
+    // custom waveform with a large "sep" reads samples before the start of audioData's arrays,
+    // which lands on frameQVariables and globalRegisters, and must keep reading what it read.
+
+    std::unique_ptr<GlobalRegisters> preparedRegisters; //!< A prepared preset's registers, which its code uses instead of globalRegisters.
+
+    /**
+     * @brief Copies a prepared preset's registers into globalRegisters, so the bytes before the
+     * audio arrays hold the live register values, as they do for a preset loaded the usual way.
+     * Call before code that reads the audio arrays.
+     */
+    void MirrorPreparedRegisters()
+    {
+        if (preparedRegisters)
+        {
+            std::copy(std::begin(preparedRegisters->values), std::end(preparedRegisters->values), std::begin(globalRegisters));
+        }
+    }
 };
 
 } // namespace MilkdropPreset

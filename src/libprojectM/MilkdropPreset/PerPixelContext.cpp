@@ -16,6 +16,21 @@ PerPixelContext::PerPixelContext(projectm_eval_mem_buffer gmegabuf, PRJM_EVAL_F 
 {
 }
 
+PerPixelContext::PerPixelContext(projectm_eval_context* adoptedContext, projectm_eval_code* adoptedCode)
+    : perPixelCodeContext(adoptedContext)
+    , perPixelCodeHandle(adoptedCode)
+{
+    RegisterVariablePointers();
+}
+
+void PerPixelContext::Release(projectm_eval_context*& context, projectm_eval_code*& code)
+{
+    context = perPixelCodeContext;
+    code = perPixelCodeHandle;
+    perPixelCodeContext = nullptr;
+    perPixelCodeHandle = nullptr;
+}
+
 PerPixelContext::~PerPixelContext()
 {
     if (perPixelCodeHandle != nullptr)
@@ -32,7 +47,11 @@ PerPixelContext::~PerPixelContext()
 void PerPixelContext::RegisterBuiltinVariables()
 {
     projectm_eval_context_reset_variables(perPixelCodeContext);
+    RegisterVariablePointers();
+}
 
+void PerPixelContext::RegisterVariablePointers()
+{
     REG_VAR(zoom);
     REG_VAR(zoomexp);
     REG_VAR(rot);

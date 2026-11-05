@@ -1,12 +1,15 @@
 #pragma once
 
 #include "Constants.hpp"
+#include "PreparedPreset.hpp"
 #include "PresetState.hpp"
 #include "ShapePerFrameContext.hpp"
 
 #include <Renderer/Mesh.hpp>
 
 #include <projectm-eval.h>
+
+#include <vector>
 
 namespace libprojectM {
 namespace MilkdropPreset {
@@ -23,6 +26,12 @@ class CustomShape
 {
 public:
     CustomShape(PresetState& presetState);
+
+    /**
+     * @brief Creates the shape around per-frame code compiled ahead of time.
+     * The block is taken over and left empty.
+     */
+    CustomShape(PresetState& presetState, PreparedPreset::Code& perFrame);
 
     virtual ~CustomShape() = default;
 
@@ -45,6 +54,21 @@ public:
     void Draw();
 
 private:
+    /**
+     * @brief What one instance needs to be drawn once its per-frame code has run.
+     */
+    struct InstanceDraw {
+        int sides{3};              //!< Number of corners, 3 to 100.
+        bool additive{false};      //!< Additive blending instead of alpha blending.
+        bool textured{false};      //!< Drawn with a texture.
+        bool useImage{false};      //!< The texture is the shape's "image" rather than the main texture.
+        bool border{false};        //!< Has an outline.
+        int iterations{1};         //!< Outline passes, 4 for a thick outline.
+        GLint fillFirst{0};        //!< First vertex of the fill in the fill mesh.
+        GLint outlineFirst{0};     //!< First vertex of the first outline pass in the outline mesh.
+        float borderColor[4]{};    //!< Outline color.
+    };
+
     Renderer::Mesh m_outlineMesh; //!< The shape's border/outline mesh.
     Renderer::Mesh m_fillMesh; //!< The shape's color/texture mesh.
 
@@ -88,6 +112,9 @@ private:
 
     PresetState& m_presetState; //!< The global preset state.
     ShapePerFrameContext m_perFrameContext;
+    bool m_codePrepared{false}; //!< The per-frame code was compiled ahead of time.
+
+    std::vector<InstanceDraw> m_instanceDraws; //!< Per-instance draw state, reused every frame. Last, so the original members keep their offsets.
 
     friend class ShapePerFrameContext;
 };

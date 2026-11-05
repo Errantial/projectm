@@ -5,7 +5,8 @@
 #include <Logging.hpp>
 
 #define REG_VAR(var) \
-    var = projectm_eval_context_register_variable(perFrameCodeContext, #var);
+    var = projectm_eval_context_register_variable(perFrameCodeContext, #var); \
+    m_builtinNames.push_back(#var);
 
 namespace libprojectM {
 namespace MilkdropPreset {
@@ -15,8 +16,28 @@ PerFrameContext::PerFrameContext(projectm_eval_mem_buffer gmegabuf, PRJM_EVAL_F 
 {
 }
 
+PerFrameContext::PerFrameContext(projectm_eval_context* adoptedContext, projectm_eval_code* adoptedCode)
+    : perFrameCodeContext(adoptedContext)
+    , perFrameCodeHandle(adoptedCode)
+{
+    RegisterVariablePointers();
+}
+
+void PerFrameContext::Release(projectm_eval_context*& context, projectm_eval_code*& code)
+{
+    context = perFrameCodeContext;
+    code = perFrameCodeHandle;
+    perFrameCodeContext = nullptr;
+    perFrameCodeHandle = nullptr;
+}
+
 PerFrameContext::~PerFrameContext()
 {
+    if (m_preparedInitCode != nullptr)
+    {
+        projectm_eval_code_destroy(m_preparedInitCode);
+    }
+
     if (perFrameCodeHandle != nullptr)
     {
         projectm_eval_code_destroy(perFrameCodeHandle);
@@ -31,7 +52,12 @@ PerFrameContext::~PerFrameContext()
 void PerFrameContext::RegisterBuiltinVariables()
 {
     projectm_eval_context_reset_variables(perFrameCodeContext);
+    RegisterVariablePointers();
+}
 
+void PerFrameContext::RegisterVariablePointers()
+{
+    m_builtinNames.clear();
     REG_VAR(zoom);
     REG_VAR(zoomexp);
     REG_VAR(rot);
@@ -114,10 +140,46 @@ void PerFrameContext::RegisterBuiltinVariables()
     REG_VAR(blur1_edge_darken);
 }
 
+void PerFrameContext::SetPreparedInitCode(projectm_eval_code* initCode, const std::array<PRJM_EVAL_F, QVarCount>& qValues)
+{
+    if (m_preparedInitCode != nullptr)
+    {
+        projectm_eval_code_destroy(m_preparedInitCode);
+    }
+    m_initPrepared = true;
+    m_preparedInitCode = initCode;
+    m_preparedQValues = qValues;
+}
+
 void PerFrameContext::EvaluateInitCode(PresetState& state)
 {
     if (state.perFrameInitCode.empty())
     {
+        return;
+    }
+
+    if (m_initPrepared)
+    {
+        // The statements that ran ahead named no built-in variable but q1-q32, which
+        // LoadStateVariables() has just set back to 0; give them the values those statements
+        // left, then run the rest as the whole block would have run here.
+        m_initPrepared = false;
+        for (int q = 0; q < QVarCount; q++)
+        {
+            *q_vars[q] = m_preparedQValues[q];
+        }
+        if (m_preparedInitCode != nullptr)
+        {
+            projectm_eval_code_execute(m_preparedInitCode);
+            projectm_eval_code_destroy(m_preparedInitCode);
+            m_preparedInitCode = nullptr;
+        }
+
+        for (int q = 0; q < QVarCount; q++)
+        {
+            q_values_after_init_code[q] = *q_vars[q];
+            state.frameQVariables[q] = *q_vars[q];
+        }
         return;
     }
 

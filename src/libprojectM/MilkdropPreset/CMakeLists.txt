@@ -57,6 +57,8 @@ add_library(MilkdropPreset OBJECT
         FinalComposite.hpp
         IdlePreset.cpp
         IdlePreset.hpp
+        InitCodeSplit.cpp
+        InitCodeSplit.hpp
         MilkdropPreset.cpp
         MilkdropPreset.hpp
         MilkdropPresetExceptions.hpp
@@ -72,6 +74,8 @@ add_library(MilkdropPreset OBJECT
         PerPixelContext.hpp
         PerPixelMesh.cpp
         PerPixelMesh.hpp
+        PreparedPreset.cpp
+        PreparedPreset.hpp
         PresetFileParser.cpp
         PresetFileParser.hpp
         PresetState.cpp
