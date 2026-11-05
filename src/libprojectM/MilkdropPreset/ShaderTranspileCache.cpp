@@ -64,8 +64,12 @@ constexpr auto ShutdownDrain = std::chrono::seconds(2);
 /// Temporary files older than this are leftovers of a process that died mid-write.
 constexpr auto StaleTemporary = std::chrono::hours(1);
 
-/// First line of a reject entry.
-constexpr const char* RejectMagic = "projectm-shader-reject 1";
+/// First line of a reject entry. Version 1 had no date; such an entry is a miss,
+/// so the shader is tried once more and a failure writes a dated one.
+constexpr const char* RejectMagic = "projectm-shader-reject 2";
+
+/// Third line of a reject entry, followed by the Unix time it was written.
+constexpr const char* RejectWrittenPrefix = "written ";
 
 /**
  * @brief Minimal SHA-256, used to name cache entries.
@@ -286,6 +290,12 @@ auto NowMilliseconds() -> double
     return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
 }
 
+/// Seconds since the Unix epoch, from the system clock.
+auto SystemWallClock() -> std::int64_t
+{
+    return static_cast<std::int64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+}
 
 /// Reads a whole file of at most `limit` bytes. False on any error or an empty file.
 auto ReadSmallFile(const std::filesystem::path& path, std::uintmax_t limit, std::string& contents, bool& damaged) -> bool
@@ -378,6 +388,8 @@ struct ShaderTranspileCache::Impl
     bool stopping{false};
     bool startupScanDone{false};
     std::chrono::steady_clock::time_point stopDeadline{};
+    //! Dates and ages reject entries; null for the system clock. Tests replace it.
+    ShaderTranspileCache::WallClock wallClock{nullptr};
 
     // Counters, guarded by `mutex`.
     std::uint64_t hits{};
@@ -389,6 +401,7 @@ struct ShaderTranspileCache::Impl
     std::uint64_t rejectHits{};
     std::uint64_t rejectsStored{};
     std::uint64_t rejectVerifyMismatches{};
+    std::uint64_t rejectsExpired{};
     std::uint64_t entriesPruned{};
     std::uint64_t stores{};
     std::uint64_t touches{};
@@ -616,6 +629,12 @@ struct ShaderTranspileCache::Impl
         EnqueueLocked(std::move(job));
     }
 
+    /// The wall clock reject entries are dated with. Called with `mutex` held.
+    auto WallSecondsLocked() const -> std::int64_t
+    {
+        return wallClock != nullptr ? wallClock() : SystemWallClock();
+    }
+
     /// Returns a queued store's payload, if one is waiting for the worker.
     /// Called with `mutex` held.
     auto PendingLocked(const std::string& name) const -> std::shared_ptr<const std::string>
@@ -838,7 +857,10 @@ struct ShaderTranspileCache::Impl
      *        are over the budget, deletes the least recently used ones.
      *
      * The modification time is the time of last use: a store sets it, and a hit
-     * refreshes it through Touch(). Another process pruning the same directory at
+     * on a GLSL entry refreshes it through Touch(). A reject entry is never
+     * touched, so its modification time is the time it was written, and it ages
+     * out here like an unused entry if it is not removed at expiry first. Another
+     * process pruning the same directory at
      * the same time only makes some removals find nothing to remove.
      */
     void ScanAndPrune()
@@ -962,7 +984,7 @@ struct ShaderTranspileCache::Impl
         std::snprintf(line, sizeof(line),
                       "[projectm shader cache] summary: directory=%s lookups=%llu hits=%llu misses=%llu hit-rate=%.1f%% "
                       "unreadable=%llu store-failures=%llu compile-failures=%llu verify-mismatches=%llu "
-                      "reject-hits=%llu rejects-stored=%llu reject-verify-mismatches=%llu pruned=%llu",
+                      "reject-hits=%llu rejects-stored=%llu rejects-expired=%llu reject-verify-mismatches=%llu pruned=%llu",
                       directory.c_str(),
                       static_cast<unsigned long long>(lookups),
                       static_cast<unsigned long long>(hits),
@@ -974,6 +996,7 @@ struct ShaderTranspileCache::Impl
                       static_cast<unsigned long long>(verifyMismatches),
                       static_cast<unsigned long long>(rejectHits),
                       static_cast<unsigned long long>(rejectsStored),
+                      static_cast<unsigned long long>(rejectsExpired),
                       static_cast<unsigned long long>(rejectVerifyMismatches),
                       static_cast<unsigned long long>(entriesPruned));
         ShaderCacheDebugLog(line);
@@ -1179,8 +1202,10 @@ auto ShaderTranspileCache::LookupRejected(const std::string& key, const std::str
 
     const std::string name = Impl::RejectName(key, driver);
     std::string contents;
+    std::int64_t now = 0;
     {
         std::lock_guard<std::mutex> lock(m_impl->mutex);
+        now = m_impl->WallSecondsLocked();
         if (auto pending = m_impl->PendingLocked(name))
         {
             contents = *pending;
@@ -1196,18 +1221,51 @@ auto ShaderTranspileCache::LookupRejected(const std::string& key, const std::str
         }
     }
 
-    // "<magic>\n<driver>\n<reason>": the driver line must match exactly, so a
-    // different driver can never read another one's verdict.
-    const std::string header = std::string(RejectMagic) + "\n" + driver + "\n";
-    if (contents.compare(0, header.size(), header) != 0)
+    // "<magic>\n<driver>\nwritten <unix seconds>\n<reason>\n": the driver line must
+    // match exactly, so a different driver can never read another one's verdict.
+    // The name already hashes the driver, so a file that fails these checks is this
+    // shader's entry in an older format or damaged, never another driver's.
+    const std::string header = std::string(RejectMagic) + "\n" + driver + "\n" + RejectWrittenPrefix;
+    bool valid = contents.compare(0, header.size(), header) == 0;
+    std::int64_t written = 0;
+    std::size_t lineEnd = std::string::npos;
+    if (valid)
     {
-        return false;
+        lineEnd = contents.find('\n', header.size());
+        const std::string date = contents.substr(header.size(), lineEnd == std::string::npos ? std::string::npos : lineEnd - header.size());
+        char* end = nullptr;
+        written = static_cast<std::int64_t>(std::strtoll(date.c_str(), &end, 10));
+        valid = lineEnd != std::string::npos && !date.empty() && end != nullptr && *end == '\0';
     }
-    reason = FirstLine(contents.substr(header.size()));
+
+    // Expired 7 days after it was written, whether or not it was hit since; an
+    // entry from the future means the clock was set back, and is not trusted.
+    const std::int64_t age = now - written;
+    const bool expired = valid && (age >= RejectLifetimeSeconds || -age > RejectFutureToleranceSeconds);
 
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (!valid || expired)
+    {
+        // Try the shader again; a fresh failure stores a new, dated entry.
+        if (expired)
+        {
+            ++m_impl->rejectsExpired;
+            if (m_impl->debug)
+            {
+                ShaderCacheDebugLog("[projectm shader cache] reject entry for key " + key.substr(0, 16) + " expired after " +
+                                    std::to_string(age / 3600) + " h; trying the shader again");
+            }
+        }
+        Impl::Job job;
+        job.kind = Impl::Job::Kind::Discard;
+        job.name = name;
+        m_impl->EnqueueLocked(std::move(job));
+        return false;
+    }
+
+    reason = FirstLine(contents.substr(lineEnd + 1));
     ++m_impl->rejectHits;
-    m_impl->RequestTouchLocked(name);
+    // No touch: a hit must not extend the entry's life or its place in the LRU order.
     return true;
 }
 
@@ -1221,9 +1279,10 @@ void ShaderTranspileCache::StoreRejected(const std::string& key, const std::stri
     Impl::Job job;
     job.kind = Impl::Job::Kind::Store;
     job.name = Impl::RejectName(key, driver);
-    job.payload = std::make_shared<const std::string>(std::string(RejectMagic) + "\n" + driver + "\n" + FirstLine(reason) + "\n");
 
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    job.payload = std::make_shared<const std::string>(std::string(RejectMagic) + "\n" + driver + "\n" + RejectWrittenPrefix +
+                                                      std::to_string(m_impl->WallSecondsLocked()) + "\n" + FirstLine(reason) + "\n");
     ++m_impl->rejectsStored;
     m_impl->EnqueueLocked(std::move(job));
 }
@@ -1299,6 +1358,17 @@ auto ShaderTranspileCache::Flush(int timeoutMilliseconds) -> bool
     };
     m_impl->idle.wait_for(lock, std::chrono::milliseconds(timeoutMilliseconds), done);
     return done();
+}
+
+auto ShaderTranspileCache::RejectEntryName(const std::string& key, const std::string& driver) -> std::string
+{
+    return Impl::RejectName(key, driver);
+}
+
+void ShaderTranspileCache::SetWallClockForTesting(WallClock clock)
+{
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+    m_impl->wallClock = clock;
 }
 
 void ShaderCacheDebugLog(const std::string& line)

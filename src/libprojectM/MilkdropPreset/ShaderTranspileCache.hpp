@@ -38,7 +38,11 @@ namespace MilkdropPreset {
  * remembered as a "<sha256 hex>.reject" entry, keyed on the same inputs plus the
  * GL vendor, renderer, version and GLSL version strings, so the next load goes
  * straight to the fallback without transpiling or compiling it again. A driver
- * update changes those strings and so invalidates every reject entry.
+ * update changes those strings and so invalidates every reject entry. A reject
+ * entry also carries the wall-clock time it was written and expires
+ * RejectLifetimeSeconds (7 days) later, so the shader is tried once more even on
+ * an unchanged driver; a fresh failure writes a new entry. A hit does not extend
+ * that life, and does not refresh the entry's recency either.
  *
  * Only reads happen on the caller's (render) thread. Every write, rename, mtime
  * update, directory scan and prune runs on one background thread per process,
@@ -46,9 +50,10 @@ namespace MilkdropPreset {
  * stops after a short idle period, so an idle process holds no extra thread.
  *
  * The directory is bounded by a byte budget (256 MiB by default) and pruned least
- * recently used first: a hit refreshes the entry's modification time from the
- * background thread, at most once per entry every ten minutes, so the modification
- * time is the time of last use, also across processes that share the directory.
+ * recently used first: a hit on a GLSL entry refreshes its modification time from
+ * the background thread, at most once per entry every ten minutes, so the
+ * modification time is the time of last use, also across processes that share the
+ * directory. A reject entry's modification time stays the time it was written.
  *
  * Configuration, read once on first use:
  * - `PROJECTM_SHADER_CACHE=0` disables the cache.
@@ -77,6 +82,24 @@ public:
      * @brief The default byte budget of the cache directory.
      */
     static constexpr std::uint64_t DefaultMaxBytes = 256ull * 1024 * 1024;
+
+    /**
+     * @brief How long a reject entry is trusted after it was written: 7 days.
+     * After that the shader is transpiled and compiled once more, and a fresh
+     * failure writes a new entry. Hits do not extend it.
+     */
+    static constexpr std::int64_t RejectLifetimeSeconds = 7 * 24 * 60 * 60;
+
+    /**
+     * @brief A reject entry dated further than this in the future is treated as
+     * expired: the clock was set back, and the entry's age cannot be trusted.
+     */
+    static constexpr std::int64_t RejectFutureToleranceSeconds = 60 * 60;
+
+    /**
+     * @brief A wall clock in seconds since the Unix epoch.
+     */
+    using WallClock = std::int64_t (*)();
 
     /**
      * @brief Returns the process-wide cache instance.
@@ -150,15 +173,20 @@ public:
 
     /**
      * @brief Returns whether this shader is known to fail on this driver.
+     *
+     * An entry older than RejectLifetimeSeconds, dated in the future, in an older
+     * format or damaged is a miss and is removed, so the shader is tried again.
+     * A hit leaves the entry's age and modification time alone.
      * @param key The entry key, as returned by Key().
      * @param driver The GL vendor, renderer, version and GLSL version strings.
      * @param reason Receives the stored reason on a hit.
-     * @return true if a reject entry for this key and driver exists.
+     * @return true if a current reject entry for this key and driver exists.
      */
     auto LookupRejected(const std::string& key, const std::string& driver, std::string& reason) -> bool;
 
     /**
-     * @brief Remembers that this shader failed on this driver. Only queues the write.
+     * @brief Remembers that this shader failed on this driver, dated now.
+     *        Only queues the write.
      * @param key The entry key, as returned by Key().
      * @param driver The GL vendor, renderer, version and GLSL version strings.
      * @param reason Where it failed ("transpile" or "driver") and the first line of
@@ -205,6 +233,18 @@ public:
      * @return true if the queue is empty.
      */
     auto Flush(int timeoutMilliseconds) -> bool;
+
+    /**
+     * @brief The file name of the reject entry for a key and driver, without the
+     *        directory. For tests that place an entry as another process would.
+     */
+    static auto RejectEntryName(const std::string& key, const std::string& driver) -> std::string;
+
+    /**
+     * @brief Replaces the wall clock reject entries are dated and aged with.
+     *        For tests only; nullptr restores the system clock.
+     */
+    void SetWallClockForTesting(WallClock clock);
 
 private:
     ShaderTranspileCache();
